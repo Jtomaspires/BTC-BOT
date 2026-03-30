@@ -1,0 +1,5 @@
+{
+  "train_end": 54000,
+  "val_end": 63000,
+  "total_rows": 69084
+}

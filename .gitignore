@@ -1,0 +1,2 @@
+# PyTorch checkpoints (training / ensemble weights)
+*.pt
