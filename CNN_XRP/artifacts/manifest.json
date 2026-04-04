@@ -1,0 +1,15 @@
+{
+  "lstm": [
+    "LSTM_model_training/LSTM_model_training/models/eq_3060_ep_114.pt",
+    "LSTM_model_training/LSTM_model_training/models/eq_2881_ep_101.pt"
+  ],
+  "hybrid": [
+    "hybrid_model_training/models/eq_2491_ep_105.pt",
+    "hybrid_model_training/models/eq_2659_ep_80.pt"
+  ],
+  "conv1d": [
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1467_ep_184.pt",
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1461_ep_180.pt",
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1458_ep_161.pt"
+  ]
+}

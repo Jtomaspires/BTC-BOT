@@ -1,5 +1,6 @@
 {
-  "train_end": 54000,
+  "train_start": 52500,
+  "train_end": 61500,
   "val_end": 63000,
-  "total_rows": 69084
+  "total_rows": 69000
 }

@@ -1,0 +1,6 @@
+{
+  "train_start": 32500,
+  "train_end": 41500,
+  "val_end": 43000,
+  "total_rows": 49000
+}

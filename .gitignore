@@ -1,2 +1,6 @@
 # PyTorch checkpoints (training / ensemble weights)
 *.pt
+
+# Model output folders (avoid committing training weights/artifacts)
+**/models/
+**/ensemble_models/

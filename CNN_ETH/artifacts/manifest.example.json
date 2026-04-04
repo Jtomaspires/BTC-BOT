@@ -1,0 +1,12 @@
+{
+  "conv1d": [
+    "CONV1D_model_training/CONV1D_model_training/models/eq_2000_ep_15.pt"
+  ],
+  "lstm": [
+    "LSTM_model_training/LSTM_model_training/models/eq_1800_ep_20.pt",
+    "LSTM_model_training/LSTM_model_training/models/eq_1750_ep_18.pt"
+  ],
+  "hybrid": [
+    "hybrid_model_training/models/eq_1900_ep_10.pt"
+  ]
+}

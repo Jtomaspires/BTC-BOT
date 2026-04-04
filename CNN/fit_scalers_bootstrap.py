@@ -1,5 +1,10 @@
-"""Fit MaxAbsScaler list on train slice [0:train_end) and write artifacts/scalers.pkl.
-Uses the same 8 features as the training/backtest notebooks."""
+"""Fit MaxAbsScaler list on train slice and write artifacts/scalers.pkl.
+Uses the same 8 features as the training/backtest notebooks.
+
+Respects artifacts/split_info.json:
+- train_start (optional; defaults to 0)
+- train_end (required)
+"""
 from pathlib import Path
 import pickle
 import numpy as np
@@ -15,8 +20,9 @@ with open(ARTIFACTS / "split_info.json", "r", encoding="utf-8") as f:
     import json
 
     sp = json.load(f)
+train_start = int(sp.get("train_start", 0))
 train_end = int(sp["train_end"])
-sub = df.iloc[:train_end]
+sub = df.iloc[train_start:train_end]
 opens = sub["open"].values
 highs = sub["high"].values
 lows = sub["low"].values

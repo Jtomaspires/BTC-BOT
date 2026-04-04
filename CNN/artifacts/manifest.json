@@ -8,7 +8,8 @@
     "hybrid_model_training/models/eq_2659_ep_80.pt"
   ],
   "conv1d": [
-    "CONV1D_model_training/CONV1D_model_training/models/eq_2433_ep_101.pt",
-    "CONV1D_model_training/CONV1D_model_training/models/eq_2373_ep_130.pt"
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1216_ep_186.pt",
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1212_ep_195.pt",
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1206_ep_188.pt"
   ]
 }
