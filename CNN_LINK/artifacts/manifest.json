@@ -1,15 +1,17 @@
 {
   "lstm": [
-    "LSTM_model_training/LSTM_model_training/models/eq_3060_ep_114.pt",
-    "LSTM_model_training/LSTM_model_training/models/eq_2881_ep_101.pt"
+    "LSTM_model_training/LSTM_model_training/models/eq_1769_ep_83.pt",
+    "LSTM_model_training/LSTM_model_training/models/eq_1700_ep_115.pt",
+    "LSTM_model_training/LSTM_model_training/models/eq_1682_ep_165.pt"
   ],
   "hybrid": [
-    "hybrid_model_training/models/eq_2491_ep_105.pt",
-    "hybrid_model_training/models/eq_2659_ep_80.pt"
+    "hybrid_model_training/models/eq_1622_ep_180.pt",
+    "hybrid_model_training/models/eq_1607_ep_64.pt",
+    "hybrid_model_training/models/eq_1598_ep_234.pt"
   ],
   "conv1d": [
-    "CONV1D_model_training/CONV1D_model_training/models/eq_1561_ep_54.pt",
-    "CONV1D_model_training/CONV1D_model_training/models/eq_1527_ep_148.pt",
-    "CONV1D_model_training/CONV1D_model_training/models/eq_1499_ep_62.pt"
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1621_ep_246.pt",
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1564_ep_237.pt",
+    "CONV1D_model_training/CONV1D_model_training/models/eq_1561_ep_54.pt"
   ]
 }

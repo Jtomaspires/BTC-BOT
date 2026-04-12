@@ -1,0 +1,25 @@
+﻿# Evita que o Cursor indexe pesos/checkpoints grandes (RAM / crashes).
+# O teu código e o Python continuam a ler estes ficheiros normalmente.
+
+# PyTorch / genéricos
+*.pth
+*.pt
+*.h5
+*.bin
+*.ckpt
+*.safetensors
+*.onnx
+*.pb
+*.pkl
+*.joblib
+*.npz
+
+# Neste repo o checkpoint de treino guarda-se sem extensão:
+training_process
+**/training_process
+
+# Pastas típicas de artefactos
+**/models/
+**/checkpoints/
+**/ensemble_models/
+**/wandb/
