@@ -1,5 +1,4 @@
 import asyncio
-from datetime import datetime
 
 from .load_scalers import train_scalers, seq_len
 from .load_models import get_action, load_model
@@ -7,114 +6,93 @@ from .bot import Bot
 
 
 async def main():
-    # Load model
+    # load_model() MUST run before create_exchange() so that a model-loading
+    # failure does not leave an open exchange connection behind.
     load_model()
 
-    # Init bot
-    bot = Bot(seq_len)
-    bot.load() 
+    bot = Bot(seq_len, testnet=True)
+    bot.load()
 
-    # # ============== TESTING ==============
+    await bot.create_exchange()
 
-    # # Create exchange 
-    # await bot.create_exchange()
+    try:
+        # Reconcile any order that was left open when the previous run crashed
+        # (e.g. WebSocket drop in the middle of a candle).
+        await bot.reconcile_pending_order()
 
-    # await bot.update_curr_futures_prices() 
-
-    # # Check position
-    # await bot.check_positions()
-
-    # # Close network
-    # await bot.close()
-
-    # # Exit
-    # exit()
-
-    # # =====================================
-
-    while True:
-        # Create exchange
-        await bot.create_exchange()
-
-        # Update new data for model
-        await bot.update_new_data_for_model()
-
-        # Get prediction from the model
-        CURR_ACTION = get_action(bot.opens_USDT,
-                                bot.highs_USDT,
-                                bot.lows_USDT,
-                                bot.closes_USDT,
-                                bot.volumes_USDT,
-                                train_scalers,)
-        
-        # Update market price
-        await bot.update_curr_futures_prices() 
-
-        # Check current position
-        await bot.check_positions() 
-
-        # Init
-        order_id = None
-
-        # BUY CASE:
-        if CURR_ACTION == 1 and bot.position != "LONG":
-            if bot.position == "SHORT":
-                is_double_size = True
-            else:
-                is_double_size = False
-            # Place limit buy order
-            order_id = await bot.place_limit_order("BUY", is_double_size)
-
-        # SELL CASE:
-        elif CURR_ACTION == 0 and bot.position != "SHORT":
-            if bot.position == "LONG":
-                is_double_size = True
-            else:
-                is_double_size = False
-            # Place limit sell order
-            order_id = await bot.place_limit_order("SELL", is_double_size)
-
-        bot.write_to_log(f"Waiting for new candle...")
+        # First wait: sit idle until the current 1h candle closes so that
+        # the very first iteration starts cleanly at a candle boundary.
+        await bot.wait_for_candle_close()
 
         while True:
-            # Calculate how many seconds left until the candle closes
-            timeframe = float("".join(ch for ch in bot.TIME_FRAME if ch.isdigit())) # Convert timeframe str to int
-            fifteen_min_secs = timeframe * 60 # Convert timeframe (like '15m') into seconds
-            minute_now = datetime.now().minute % timeframe # Current minute within this timeframe (e.g., 0–14 for 15m)
-            now_secs = minute_now * 60 + datetime.now().second # How many seconds have passed so far in this candle
-            wait_secs = fifteen_min_secs - now_secs # How many seconds left until the candle closes
+            order_id = None
 
-            # Small sleep so the loop doesn’t burn CPU
-            await asyncio.sleep(0.5) 
+            # ---- Signal phase (start of new candle) ----
 
-            # Once we’re in the last few seconds of this candle, break the loop
-            if wait_secs < bot.last_sec_wait:
-                break
+            # Fetch the last seq_len closed candles
+            await bot.update_new_data_for_model()
 
-        # Cancel any open order 
-        await bot.cancel_order(order_id) 
+            # Compute model signal: +1 long, -1 short, 0 neutral
+            CURR_ACTION = get_action(
+                bot.opens_USDT,
+                bot.highs_USDT,
+                bot.lows_USDT,
+                bot.closes_USDT,
+                bot.volumes_USDT,
+                train_scalers,
+            )
 
-        # Check order fee
-        fee = await bot.get_order_fee(order_id)
+            # Fetch live price (used for limit order reference)
+            await bot.update_curr_futures_prices()
 
-        # Update total fee
-        bot.total_fee += fee
+            # Check current open position
+            await bot.check_positions()
 
-        # Check equity
-        await bot.check_equity()
+            # ---- Order placement ----
+            # CURR_ACTION == 0 (neutral): no new order; existing position is
+            # held as-is (aligned with backtest: only SL/TP/reversal closes).
 
-        # Record results for later analysis
-        bot.actions.append(CURR_ACTION)
-        bot.open_prices.append(bot.curr_open)
-        bot.equities.append(bot.equity)
-        
-        # Save the bot's state
-        bot.save()
+            if CURR_ACTION == 1 and bot.position != "LONG":
+                is_double_size = bot.position == "SHORT"
+                order_id = await bot.place_limit_order("BUY", is_double_size)
 
-        # Plot performance
-        bot.plot_performance()
+            elif CURR_ACTION == -1 and bot.position != "SHORT":
+                is_double_size = bot.position == "LONG"
+                order_id = await bot.place_limit_order("SELL", is_double_size)
 
-        # Close connections
+            bot.write_to_log(
+                f"Action={CURR_ACTION}  Position={bot.position}  "
+                f"order_id={order_id}  Waiting for candle close ..."
+            )
+
+            # Persist pending order so a crash during the wait can be recovered.
+            bot.pending_order_id = order_id
+            bot.save()
+
+            # ---- Execution window: wait for this candle to close ----
+            await bot.wait_for_candle_close()
+
+            # ---- Post-candle cleanup ----
+
+            if order_id is not None:
+                await bot.cancel_order(order_id)
+                fee = await bot.get_order_fee(order_id)
+                bot.total_fee += fee
+
+            # Clear pending order now that cleanup is done.
+            bot.pending_order_id = None
+
+            await bot.check_equity()
+
+            # Record for performance tracking
+            bot.actions.append(CURR_ACTION)
+            bot.open_prices.append(bot.curr_open)
+            bot.equities.append(bot.equity)
+
+            bot.save()
+            bot.plot_performance()
+
+    finally:
         await bot.close_exchange()
 
 
@@ -122,37 +100,8 @@ if __name__ == "__main__":
     while True:
         try:
             asyncio.run(main())
-
+        except KeyboardInterrupt:
+            print("Interrupted.")
+            break
         except Exception as e:
             print(f"Error: {e}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

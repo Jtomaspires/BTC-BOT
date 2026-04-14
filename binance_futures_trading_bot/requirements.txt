@@ -3,4 +3,6 @@ numpy
 matplotlib
 scikit-learn
 ccxt
-python-binance
+websockets
+torch
+python-dotenv

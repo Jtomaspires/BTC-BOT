@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+*.pkl
+log.log
+trading_bot/performance.png
