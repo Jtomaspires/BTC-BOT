@@ -3,11 +3,15 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import ccxt.async_support as ccxt_async
 import websockets
 from dotenv import load_dotenv
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_ENV_PATH = _SCRIPT_DIR / ".env"
 
 
 @dataclass(frozen=True)
@@ -26,8 +30,8 @@ def _bool_env(name: str) -> bool | None:
 
 
 def _load_exchange_config(force_testnet: bool | None, live: bool) -> ExchangeConfig:
-    # Load .env from current working directory (best-effort).
-    load_dotenv()
+    # Load credentials from bot-local .env, independent of process cwd.
+    load_dotenv(dotenv_path=_ENV_PATH)
 
     api_key = os.getenv("BINANCE_API_KEY", "").strip()
     api_secret = os.getenv("BINANCE_API_SECRET", "").strip()

@@ -17,8 +17,14 @@ async def main():
 
     try:
         # Reconcile any order that was left open when the previous run crashed
-        # (e.g. WebSocket drop in the middle of a candle).
+        # (e.g. WebSocket drop mid-candle, stale pending id from older runs).
         await bot.reconcile_pending_order()
+
+        # Ensure any pre-existing open position on the exchange has fresh
+        # SL/TP orders attached to it. This covers the case where a previous
+        # run filled an entry but failed to place protection before crashing,
+        # and also restores protection after a plain restart.
+        await bot.reconcile_position_protection()
 
         # First wait: sit idle until the current 1h candle closes so that
         # the very first iteration starts cleanly at a candle boundary.
@@ -26,13 +32,13 @@ async def main():
 
         while True:
             order_id = None
+            entry_side = None
+            fill_price = None
 
             # ---- Signal phase (start of new candle) ----
 
-            # Fetch the last seq_len closed candles
             await bot.update_new_data_for_model()
 
-            # Compute model signal: +1 long, -1 short, 0 neutral
             CURR_ACTION = get_action(
                 bot.opens_USDT,
                 bot.highs_USDT,
@@ -42,30 +48,33 @@ async def main():
                 train_scalers,
             )
 
-            # Fetch live price (used for limit order reference)
             await bot.update_curr_futures_prices()
-
-            # Check current open position
             await bot.check_positions()
 
-            # ---- Order placement ----
-            # CURR_ACTION == 0 (neutral): no new order; existing position is
-            # held as-is (aligned with backtest: only SL/TP/reversal closes).
+            # ---- Decide action ----
+            # Rules (aligned with CNN_ETH backtest):
+            #   * Enter only when currently flat.
+            #   * While a position is open, ignore opposite/neutral signals.
+            #   * Position exits are handled by SL/TP protection orders.
+            if bot.position == "NONE":
+                if CURR_ACTION == 1:
+                    order_id, fill_price = await bot.place_market_order("BUY")
+                    entry_side = "BUY"
+                elif CURR_ACTION == -1:
+                    order_id, fill_price = await bot.place_market_order("SELL")
+                    entry_side = "SELL"
 
-            if CURR_ACTION == 1 and bot.position != "LONG":
-                is_double_size = bot.position == "SHORT"
-                order_id = await bot.place_limit_order("BUY", is_double_size)
-
-            elif CURR_ACTION == -1 and bot.position != "SHORT":
-                is_double_size = bot.position == "LONG"
-                order_id = await bot.place_limit_order("SELL", is_double_size)
+            if order_id is not None and fill_price is not None and entry_side is not None:
+                # Backtest evaluates entries at candle open; anchor SL/TP to
+                # current candle open to keep USD distances comparable.
+                await bot.place_sl_tp_orders(bot.curr_open, entry_side)
 
             bot.write_to_log(
                 f"Action={CURR_ACTION}  Position={bot.position}  "
                 f"order_id={order_id}  Waiting for candle close ..."
             )
 
-            # Persist pending order so a crash during the wait can be recovered.
+            # Persist so a crash during the wait can still be reconciled.
             bot.pending_order_id = order_id
             bot.save()
 
@@ -73,18 +82,26 @@ async def main():
             await bot.wait_for_candle_close()
 
             # ---- Post-candle cleanup ----
-
+            # Market entries are already filled when we get here, so there is
+            # NOTHING to cancel about `order_id`. We only need to:
+            #   1) Collect the entry fee (if we placed an entry this cycle).
+            #   2) If SL/TP fired mid-candle (position flat), drop any
+            #      leftover protection id we are still tracking. No-op when
+            #      position is still open in the same direction.
             if order_id is not None:
-                await bot.cancel_order(order_id)
                 fee = await bot.get_order_fee(order_id)
                 bot.total_fee += fee
 
-            # Clear pending order now that cleanup is done.
+            await bot.check_positions()
+            if bot.position == "NONE" and (
+                bot.sl_order_id is not None or bot.tp_order_id is not None
+            ):
+                await bot.cancel_sl_tp_orders()
+
             bot.pending_order_id = None
 
             await bot.check_equity()
 
-            # Record for performance tracking
             bot.actions.append(CURR_ACTION)
             bot.open_prices.append(bot.curr_open)
             bot.equities.append(bot.equity)
