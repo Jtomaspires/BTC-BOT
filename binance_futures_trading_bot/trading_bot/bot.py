@@ -427,15 +427,16 @@ class Bot:
 
         # Backtest uses OHLC (trade/contract price), not mark price. Using
         # CONTRACT_PRICE keeps trigger semantics closer to the backtest.
+        # NOTE: Binance rejects `reduceOnly` together with `closePosition`
+        # (error -1106). `closePosition=true` already implies reduce-only
+        # semantics and flattens the whole position on trigger.
         params_sl = {
             "stopPrice": sl_price,
-            "reduceOnly": True,
             "closePosition": True,
             "workingType": "CONTRACT_PRICE",
         }
         params_tp = {
             "stopPrice": tp_price,
-            "reduceOnly": True,
             "closePosition": True,
             "workingType": "CONTRACT_PRICE",
         }
@@ -668,8 +669,9 @@ class Bot:
         """
         Fetch the currently open position for `self.symbol`.
 
-        Returns (entry_price, side) where side is 'long' / 'short',
-        or None if there is no open position / entryPrice is missing.
+        Returns (entry_price, side, qty) where side is 'long' / 'short' and
+        qty is the absolute contracts size, or None if there is no open
+        position / entryPrice is missing.
         """
         for _ in range(20):
             try:
@@ -704,15 +706,63 @@ class Bot:
         if side not in ("long", "short"):
             return None
 
-        return entry_price, side
+        try:
+            qty = abs(float(pos.get("contracts") or 0.0))
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            return None
+
+        return entry_price, side, qty
+
+    async def _close_position_market(self, side: str, qty: float) -> None:
+        """
+        Flatten an open position with a market reduce-only order.
+
+        `side` is the position side ('long'/'short'); the order is the opposite.
+        """
+        exit_side = "sell" if side == "long" else "buy"
+        qty = float(self.exchange.amount_to_precision(self.symbol, qty))
+
+        for attempt in range(10):
+            try:
+                order = await self.exchange.create_order(
+                    self.symbol,
+                    "market",
+                    exit_side,
+                    qty,
+                    None,
+                    {"reduceOnly": True},
+                )
+                self.write_to_log(
+                    f"Reconcile: closed stale {side.upper()} at market "
+                    f"(qty={qty}, order={order.get('id')})."
+                )
+                return
+            except Exception as err:
+                self.write_to_log(
+                    f"Reconcile market-close attempt {attempt + 1}/10 failed: {err}"
+                )
+                await asyncio.sleep(0.5)
+
+        self.write_to_log(
+            "WARNING: reconcile market-close exhausted retries. "
+            "Position may still be open. Manual intervention required."
+        )
 
     async def reconcile_position_protection(self):
         """
-        Ensure any open position has fresh SL/TP orders at startup.
+        Ensure any open position has fresh SL/TP orders at startup, OR flatten
+        it immediately when SL/TP would already have triggered.
 
         1) Cancel any tracked SL/TP ids (may be stale across restarts).
-        2) If a position is open on the exchange, place new SL/TP anchored
-           to its real entry price reported by Binance.
+        2) If a position is open on the exchange:
+             a) If current price is already past TP (profit) or past SL (loss),
+                close the position at market — the protection would have fired
+                while the bot was down. This matches the backtest semantics of
+                an intra-candle SL/TP exit.
+             b) Otherwise, place fresh SL/TP anchored to the real entry price
+                reported by Binance.
 
         Safe to call even when there is no open position.
         """
@@ -725,14 +775,49 @@ class Bot:
             )
             return
 
-        entry_price, side = position_info
-        entry_side = "BUY" if side == "long" else "SELL"
+        entry_price, side, qty = position_info
+
+        # We need a current price to know if SL/TP would trigger immediately.
+        try:
+            ticker = await self.exchange.fetch_ticker(self.symbol)
+            last_price = float(ticker["last"])
+        except Exception as err:
+            last_price = None
+            self.write_to_log(
+                f"Startup protection: could not fetch ticker ({err}); "
+                "will try to place SL/TP anyway."
+            )
+
+        if side == "long":
+            sl_price = entry_price - self.sl_points
+            tp_price = entry_price + self.tp_points
+            tp_hit = last_price is not None and last_price >= tp_price
+            sl_hit = last_price is not None and last_price <= sl_price
+        else:
+            sl_price = entry_price + self.sl_points
+            tp_price = entry_price - self.tp_points
+            tp_hit = last_price is not None and last_price <= tp_price
+            sl_hit = last_price is not None and last_price >= sl_price
 
         self.write_to_log(
-            f"Startup protection: {side.upper()} position detected at "
-            f"entry={entry_price:.2f}. Placing fresh SL/TP ..."
+            f"Startup protection: {side.upper()} entry={entry_price:.2f} "
+            f"last={last_price if last_price is None else f'{last_price:.2f}'} "
+            f"sl={sl_price:.2f} tp={tp_price:.2f}"
         )
 
+        if tp_hit or sl_hit:
+            reason = "TP" if tp_hit else "SL"
+            self.write_to_log(
+                f"Startup protection: price already past {reason}; "
+                "flattening position at market."
+            )
+            await self._close_position_market(side, qty)
+            self.sl_order_id = None
+            self.tp_order_id = None
+            self.save()
+            return
+
+        entry_side = "BUY" if side == "long" else "SELL"
         try:
             await self.place_sl_tp_orders(entry_price, entry_side)
         except Exception as err:

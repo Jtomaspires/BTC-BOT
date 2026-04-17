@@ -6,4 +6,5 @@ __pycache__/
 *.py[cod]
 *.pkl
 log.log
+logs/
 trading_bot/performance.png
