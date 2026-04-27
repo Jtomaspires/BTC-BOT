@@ -4,3 +4,7 @@
 # Model output folders (avoid committing training weights/artifacts)
 **/models/
 **/ensemble_models/
+
+# INF walk-forward outputs
+INF/outputs/**
+!INF/outputs/.gitkeep
