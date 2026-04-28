@@ -21,12 +21,80 @@ def _make_linear_dataset(rng, n_samples, seq_len, n_feat):
 
 
 class TestTrainer(unittest.TestCase):
+    def test_class_indices_split_long_short_neutral(self):
+        y = np.asarray(
+            [
+                [0.5, 0.0],
+                [0.2, 0.0],
+                [0.01, 0.0],
+                [-0.02, 0.0],
+                [-0.4, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        long_idx, short_idx, neutral_idx = TR._class_indices(y, target_channel=0, threshold=0.05)
+        self.assertEqual(long_idx.tolist(), [0, 1])
+        self.assertEqual(short_idx.tolist(), [4])
+        self.assertEqual(neutral_idx.tolist(), [2, 3])
+
     def test_build_sequences_shape(self):
         fts = np.arange(60, dtype=np.float32).reshape(10, 6)
         x, y = TR.build_sequences(fts, seq_len=4)
         self.assertEqual(x.shape, (6, 4, 6))
         self.assertEqual(y.shape, (6, 6))
         self.assertTrue(np.allclose(y[0], fts[4]))
+
+    def test_undersample_balances_directional_classes_deterministic(self):
+        y = np.zeros((18, 2), dtype=np.float32)
+        y[:10, 0] = 0.2
+        y[10:13, 0] = -0.3
+        y[13:, 0] = 0.0
+
+        idx_a, applied_a, note_a = TR._build_undersampled_indices(
+            y_train=y,
+            target_channel=0,
+            threshold=0.05,
+            neutral_policy="cap_ratio",
+            max_neutral_ratio=1.0,
+            seed=7,
+        )
+        idx_b, applied_b, note_b = TR._build_undersampled_indices(
+            y_train=y,
+            target_channel=0,
+            threshold=0.05,
+            neutral_policy="cap_ratio",
+            max_neutral_ratio=1.0,
+            seed=7,
+        )
+        self.assertTrue(applied_a)
+        self.assertTrue(applied_b)
+        self.assertEqual(note_a, "")
+        self.assertEqual(note_b, "")
+        self.assertEqual(idx_a.tolist(), idx_b.tolist())
+
+        y_bal = y[idx_a]
+        long_idx, short_idx, neutral_idx = TR._class_indices(y_bal, target_channel=0, threshold=0.05)
+        self.assertEqual(len(long_idx), len(short_idx))
+        self.assertLessEqual(len(neutral_idx), len(long_idx))
+
+    def test_weighted_sampler_gives_higher_weight_to_minority(self):
+        y = np.zeros((30, 2), dtype=np.float32)
+        y[:20, 0] = 0.25
+        y[20:24, 0] = -0.25
+        y[24:, 0] = 0.0
+
+        weights, applied, note = TR._build_weighted_sampler_weights(
+            y_train=y,
+            target_channel=0,
+            threshold=0.05,
+            neutral_policy="drop",
+            max_neutral_ratio=1.0,
+        )
+        self.assertTrue(applied)
+        self.assertEqual(note, "")
+        long_idx, short_idx, neutral_idx = TR._class_indices(y, target_channel=0, threshold=0.05)
+        self.assertGreater(float(weights[short_idx[0]]), float(weights[long_idx[0]]))
+        self.assertTrue(np.allclose(weights[neutral_idx], 0.0))
 
     def test_val_loss_path_legacy_single_checkpoint(self):
         rng = np.random.default_rng(0)
@@ -59,6 +127,9 @@ class TestTrainer(unittest.TestCase):
             self.assertEqual(len(result.best_checkpoint_paths), 1)
             self.assertTrue(result.best_checkpoint_paths[0].name == "best_val_loss.pt")
             self.assertLess(result.best_val_loss, result.history["val_loss"][0])
+            self.assertIsNotNone(result.balance_stats)
+            self.assertFalse(bool(result.balance_stats.get("enabled", True)))
+            self.assertFalse(bool(result.balance_stats.get("applied", True)))
 
     def test_val_equity_keeps_only_top_k(self):
         rng = np.random.default_rng(1)

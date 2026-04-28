@@ -1,6 +1,6 @@
 # Única fonte de verdade para uma corrida de walk-forward (sem lógica em Python aqui).
 # Paths relativos resolvem-se à raiz do repositório (pasta NN/) salvo indicação contrária no loader.
-config_name: eth_1h_baseline
+config_name: eth_1h_baseline_original
 
 # Opcional: para batch interno no mesmo ficheiro, use `experiments`.
 # Em modo single-config, deixe sem `experiments` e o pipeline mantém compatibilidade.
@@ -78,28 +78,12 @@ outputs:
   output_dir: INF/outputs
 
 experiments:
-  - name: feat_baseline_8
-    features:
-      list:
-        - body_over_open
-        - high_minus_open_over_open
-        - high_minus_close_over_close
-        - low_minus_open_over_open
-        - low_minus_close_over_close
-        - range_over_open
-        - range_over_close
-        - volume
-  - name: feat_compact_5
-    features:
-      list:
-        - body_over_open
-        - high_minus_open_over_open
-        - low_minus_open_over_open
-        - range_over_open
-        - volume
-  - name: feat_min_3
-    features:
-      list:
-        - body_over_open
-        - range_over_open
-        - volume
+  - name: thr_0_007
+    backtest:
+      signal_threshold: 0.007
+  - name: thr_0_008
+    backtest:
+      signal_threshold: 0.008
+  - name: thr_0_01
+    backtest:
+      signal_threshold: 0.01

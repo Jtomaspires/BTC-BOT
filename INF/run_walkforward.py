@@ -9,7 +9,7 @@ import copy
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -200,6 +200,92 @@ def _resolve_feature_list_from_cfg(cfg: Mapping[str, Any]) -> list[str]:
     return resolve_feature_list(raw)
 
 
+def _resolve_training_cfg(training_cfg: Mapping[str, Any], backtest_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    resolved = copy.deepcopy(dict(training_cfg))
+    class_balance = resolved.get("class_balance")
+    if isinstance(class_balance, Mapping):
+        cb = dict(class_balance)
+        threshold_raw = cb.get("threshold", "auto")
+        if isinstance(threshold_raw, str) and threshold_raw.strip().lower() == "auto":
+            cb["threshold"] = float(backtest_cfg.get("signal_threshold", 0.0))
+        resolved["class_balance"] = cb
+    return resolved
+
+
+def _attach_balance_columns(
+    df: pd.DataFrame,
+    *,
+    architectures: Sequence[str],
+    balance_stats_by_arch: Mapping[str, Mapping[str, Any]],
+) -> pd.DataFrame:
+    out = df.copy()
+    agg_before_long = 0
+    agg_before_short = 0
+    agg_before_neutral = 0
+    agg_after_long = 0
+    agg_after_short = 0
+    agg_after_neutral = 0
+    enabled_any = False
+    applied_any = False
+    sampler_any = False
+    methods: list[str] = []
+    statuses: list[str] = []
+
+    for arch in architectures:
+        key = _slugify(arch)
+        stats = dict(balance_stats_by_arch.get(arch, {}))
+        enabled = bool(stats.get("enabled", False))
+        applied = bool(stats.get("applied", False))
+        sampler_enabled = bool(stats.get("sampler_enabled", False))
+        status = str(stats.get("status", "disabled"))
+        method = str(stats.get("method", "weighted_sampler"))
+        threshold = float(stats.get("threshold", 0.0))
+        before_long = int(stats.get("before_count_long", 0))
+        before_short = int(stats.get("before_count_short", 0))
+        before_neutral = int(stats.get("before_count_neutral", 0))
+        after_long = int(stats.get("after_count_long", 0))
+        after_short = int(stats.get("after_count_short", 0))
+        after_neutral = int(stats.get("after_count_neutral", 0))
+
+        out[f"bal_enabled_{key}"] = enabled
+        out[f"bal_applied_{key}"] = applied
+        out[f"bal_sampler_{key}"] = sampler_enabled
+        out[f"bal_method_{key}"] = method
+        out[f"bal_status_{key}"] = status
+        out[f"bal_threshold_{key}"] = threshold
+        out[f"bal_before_long_{key}"] = before_long
+        out[f"bal_before_short_{key}"] = before_short
+        out[f"bal_before_neutral_{key}"] = before_neutral
+        out[f"bal_after_long_{key}"] = after_long
+        out[f"bal_after_short_{key}"] = after_short
+        out[f"bal_after_neutral_{key}"] = after_neutral
+
+        agg_before_long += before_long
+        agg_before_short += before_short
+        agg_before_neutral += before_neutral
+        agg_after_long += after_long
+        agg_after_short += after_short
+        agg_after_neutral += after_neutral
+        enabled_any = enabled_any or enabled
+        applied_any = applied_any or applied
+        sampler_any = sampler_any or sampler_enabled
+        methods.append(method)
+        statuses.append(status)
+
+    out["bal_enabled_any"] = enabled_any
+    out["bal_applied_any"] = applied_any
+    out["bal_sampler_any"] = sampler_any
+    out["bal_methods"] = ",".join(methods)
+    out["bal_statuses"] = ",".join(statuses)
+    out["bal_before_long_total"] = agg_before_long
+    out["bal_before_short_total"] = agg_before_short
+    out["bal_before_neutral_total"] = agg_before_neutral
+    out["bal_after_long_total"] = agg_after_long
+    out["bal_after_short_total"] = agg_after_short
+    out["bal_after_neutral_total"] = agg_after_neutral
+    return out
+
+
 def _run_single_experiment(
     cfg: Mapping[str, Any],
     *,
@@ -213,12 +299,13 @@ def _run_single_experiment(
     data_cfg = cfg["data"]
     preprocess_cfg = cfg["preprocess"]
     walk_cfg = cfg["walkforward"]
-    train_cfg = cfg["training"]
+    train_cfg = _resolve_training_cfg(cfg["training"], cfg["backtest"])
     model_cfg = cfg["model"]
     backtest_cfg = cfg["backtest"]
     features_used = _resolve_feature_list_from_cfg(cfg)
 
     resolved_cfg = copy.deepcopy(dict(cfg))
+    resolved_cfg["training"] = copy.deepcopy(dict(train_cfg))
     resolved_cfg["features"] = {"list": list(features_used)}
     _save_yaml(run_dir / "config.resolved.yaml", resolved_cfg)
 
@@ -320,6 +407,7 @@ def _run_single_experiment(
         raw_signal_val_per_ckpt: list[np.ndarray] = []
         raw_signal_test_per_ckpt: list[np.ndarray] = []
         checkpoints_by_arch: dict[str, int] = {}
+        balance_stats_by_arch: dict[str, dict[str, Any]] = {}
         for arch in architectures:
             train_result = train_window(
                 training_cfg=train_cfg,
@@ -338,6 +426,7 @@ def _run_single_experiment(
                 signal_threshold=float(backtest_cfg["signal_threshold"]),
             )
             checkpoints_by_arch[arch] = len(train_result.best_checkpoint_paths)
+            balance_stats_by_arch[arch] = dict(train_result.balance_stats or {})
             for ckpt_path in train_result.best_checkpoint_paths:
                 model = get_model(arch, num_features=train_result.num_features).to(device)
                 try:
@@ -393,6 +482,11 @@ def _run_single_experiment(
         val_df_metrics.insert(3, "num_checkpoints", len(raw_signal_val_per_ckpt))
         for arch in architectures:
             val_df_metrics[f"num_ckpts_{arch}"] = int(checkpoints_by_arch.get(arch, 0))
+        val_df_metrics = _attach_balance_columns(
+            val_df_metrics,
+            architectures=architectures,
+            balance_stats_by_arch=balance_stats_by_arch,
+        )
         best_sl, best_tp, best_trailing_stop, best_score = select_best_grid_params(
             val_grid_results,
             metric=str(backtest_cfg.get("grid_select_metric", "sharpe")),
@@ -447,6 +541,11 @@ def _run_single_experiment(
             test_df_metrics.insert(3, "num_checkpoints", len(raw_signal_test_per_ckpt))
             for arch in architectures:
                 test_df_metrics[f"num_ckpts_{arch}"] = int(checkpoints_by_arch.get(arch, 0))
+            test_df_metrics = _attach_balance_columns(
+                test_df_metrics,
+                architectures=architectures,
+                balance_stats_by_arch=balance_stats_by_arch,
+            )
             test_df_metrics["is_best"] = True
             test_df_metrics["best_score"] = best_score
             per_split_metrics.append(test_df_metrics)

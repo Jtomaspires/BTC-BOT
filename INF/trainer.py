@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from models import get_model
 
@@ -42,6 +42,7 @@ class TrainResult:
     num_features: int
     best_epoch: int
     checkpoint_metric: str = "val_equity"
+    balance_stats: Dict[str, Any] | None = None
 
     @property
     def best_checkpoint_path(self) -> Path:
@@ -95,6 +96,194 @@ def _to_tensor(values, name: str, ndim: int) -> torch.Tensor:
     if arr.ndim != ndim:
         raise ValueError(f"{name} deve ser {ndim}D; recebido shape={arr.shape}")
     return torch.from_numpy(arr)
+
+
+def _resolve_class_balance_cfg(training_cfg: Mapping[str, Any], *, fallback_threshold: float) -> dict[str, Any]:
+    raw = training_cfg.get("class_balance")
+    if raw is None:
+        return {
+            "enabled": False,
+            "method": "weighted_sampler",
+            "target_channel": 0,
+            "threshold": float(fallback_threshold),
+            "neutral_policy": "keep",
+            "max_neutral_ratio": 1.0,
+        }
+    if not isinstance(raw, Mapping):
+        raise ValueError("training.class_balance deve ser um mapeamento quando definido")
+
+    enabled = bool(raw.get("enabled", False))
+    method = str(raw.get("method", "weighted_sampler")).strip().lower()
+    if method not in {"weighted_sampler", "undersample"}:
+        raise ValueError("training.class_balance.method deve ser 'weighted_sampler' ou 'undersample'")
+
+    target_channel = int(raw.get("target_channel", 0))
+    if target_channel < 0:
+        raise ValueError("training.class_balance.target_channel deve ser >= 0")
+
+    threshold_raw = raw.get("threshold", "auto")
+    if isinstance(threshold_raw, str):
+        if threshold_raw.strip().lower() == "auto":
+            threshold = float(fallback_threshold)
+        else:
+            threshold = float(threshold_raw)
+    else:
+        threshold = float(threshold_raw)
+    if threshold < 0:
+        raise ValueError("training.class_balance.threshold deve ser >= 0")
+
+    neutral_policy = str(raw.get("neutral_policy", "keep")).strip().lower()
+    if neutral_policy not in {"keep", "drop", "cap_ratio"}:
+        raise ValueError("training.class_balance.neutral_policy deve ser keep/drop/cap_ratio")
+
+    max_neutral_ratio = float(raw.get("max_neutral_ratio", 1.0))
+    if max_neutral_ratio < 0:
+        raise ValueError("training.class_balance.max_neutral_ratio deve ser >= 0")
+
+    return {
+        "enabled": enabled,
+        "method": method,
+        "target_channel": target_channel,
+        "threshold": threshold,
+        "neutral_policy": neutral_policy,
+        "max_neutral_ratio": max_neutral_ratio,
+    }
+
+
+def _class_indices(y: np.ndarray, *, target_channel: int, threshold: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    arr = np.asarray(y, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Y_train deve ser 2D; recebido shape={arr.shape}")
+    if target_channel >= arr.shape[1]:
+        raise ValueError(
+            f"training.class_balance.target_channel={target_channel} fora do intervalo "
+            f"[0, {arr.shape[1] - 1}]"
+        )
+    t = arr[:, target_channel].astype(np.float64)
+    long_idx = np.where(t > float(threshold))[0].astype(np.int64)
+    short_idx = np.where(t < -float(threshold))[0].astype(np.int64)
+    neutral_idx = np.where(np.abs(t) <= float(threshold))[0].astype(np.int64)
+    return long_idx, short_idx, neutral_idx
+
+
+def _class_count_stats(long_idx: np.ndarray, short_idx: np.ndarray, neutral_idx: np.ndarray) -> dict[str, Any]:
+    total = int(len(long_idx) + len(short_idx) + len(neutral_idx))
+    if total <= 0:
+        return {
+            "count_total": 0,
+            "count_long": 0,
+            "count_short": 0,
+            "count_neutral": 0,
+            "ratio_long": 0.0,
+            "ratio_short": 0.0,
+            "ratio_neutral": 0.0,
+        }
+    return {
+        "count_total": total,
+        "count_long": int(len(long_idx)),
+        "count_short": int(len(short_idx)),
+        "count_neutral": int(len(neutral_idx)),
+        "ratio_long": float(len(long_idx) / total),
+        "ratio_short": float(len(short_idx) / total),
+        "ratio_neutral": float(len(neutral_idx) / total),
+    }
+
+
+def _apply_neutral_policy(
+    neutral_idx: np.ndarray,
+    *,
+    neutral_policy: str,
+    max_neutral_ratio: float,
+    reference_class_size: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if neutral_policy == "drop":
+        return np.asarray([], dtype=np.int64)
+    if neutral_policy == "keep":
+        return neutral_idx
+    cap = int(np.floor(max_neutral_ratio * max(reference_class_size, 0)))
+    if cap <= 0:
+        return np.asarray([], dtype=np.int64)
+    if len(neutral_idx) <= cap:
+        return neutral_idx
+    return np.asarray(rng.choice(neutral_idx, size=cap, replace=False), dtype=np.int64)
+
+
+def _build_undersampled_indices(
+    *,
+    y_train: np.ndarray,
+    target_channel: int,
+    threshold: float,
+    neutral_policy: str,
+    max_neutral_ratio: float,
+    seed: int,
+) -> tuple[np.ndarray, bool, str]:
+    long_idx, short_idx, neutral_idx = _class_indices(
+        y_train,
+        target_channel=target_channel,
+        threshold=threshold,
+    )
+    if len(long_idx) == 0 or len(short_idx) == 0:
+        keep = np.arange(y_train.shape[0], dtype=np.int64)
+        return keep, False, "insufficient_directional_samples"
+
+    rng = np.random.default_rng(seed)
+    min_class = min(len(long_idx), len(short_idx))
+    if len(long_idx) > min_class:
+        long_idx = np.asarray(rng.choice(long_idx, size=min_class, replace=False), dtype=np.int64)
+    if len(short_idx) > min_class:
+        short_idx = np.asarray(rng.choice(short_idx, size=min_class, replace=False), dtype=np.int64)
+    neutral_keep = _apply_neutral_policy(
+        neutral_idx,
+        neutral_policy=neutral_policy,
+        max_neutral_ratio=max_neutral_ratio,
+        reference_class_size=min_class,
+        rng=rng,
+    )
+    balanced_idx = np.concatenate([long_idx, short_idx, neutral_keep], axis=0)
+    rng.shuffle(balanced_idx)
+    return balanced_idx.astype(np.int64), True, ""
+
+
+def _build_weighted_sampler_weights(
+    *,
+    y_train: np.ndarray,
+    target_channel: int,
+    threshold: float,
+    neutral_policy: str,
+    max_neutral_ratio: float,
+) -> tuple[np.ndarray, bool, str]:
+    long_idx, short_idx, neutral_idx = _class_indices(
+        y_train,
+        target_channel=target_channel,
+        threshold=threshold,
+    )
+    if len(long_idx) == 0 or len(short_idx) == 0:
+        weights = np.ones(y_train.shape[0], dtype=np.float32)
+        return weights, False, "insufficient_directional_samples"
+
+    weights = np.zeros(y_train.shape[0], dtype=np.float32)
+    weights[long_idx] = np.float32(1.0 / len(long_idx))
+    weights[short_idx] = np.float32(1.0 / len(short_idx))
+
+    min_class = min(len(long_idx), len(short_idx))
+    neutral_mass = 0.0
+    if neutral_policy == "keep":
+        neutral_mass = float(len(neutral_idx) / max(min_class, 1))
+    elif neutral_policy == "cap_ratio":
+        keep_mass = float(len(neutral_idx) / max(min_class, 1))
+        neutral_mass = float(min(keep_mass, max_neutral_ratio))
+
+    if len(neutral_idx) > 0 and neutral_mass > 0:
+        weights[neutral_idx] = np.float32(neutral_mass / len(neutral_idx))
+    if not np.any(weights > 0):
+        weights[:] = 1.0
+        return weights, False, "all_weights_zero_fallback"
+    return weights, True, ""
+
+
+def _prefix_stats(stats: Mapping[str, Any], *, prefix: str) -> dict[str, Any]:
+    return {f"{prefix}_{k}": v for k, v in stats.items()}
 
 
 def compute_val_equity(
@@ -239,17 +428,103 @@ def train_window(
     set_seed(seed)
     device = _choose_device(str(training_cfg.get("device", "auto")))
 
-    x_train = _to_tensor(X_train, "X_train", 3)
-    y_train = _to_tensor(Y_train, "Y_train", 2)
-    x_val = _to_tensor(X_val, "X_val", 3)
-    y_val = _to_tensor(Y_val, "Y_val", 2)
+    x_train_np = np.asarray(X_train, dtype=np.float32)
+    y_train_np = np.asarray(Y_train, dtype=np.float32)
+    x_val_np = np.asarray(X_val, dtype=np.float32)
+    y_val_np = np.asarray(Y_val, dtype=np.float32)
+    if x_train_np.ndim != 3:
+        raise ValueError(f"X_train deve ser 3D; recebido shape={x_train_np.shape}")
+    if y_train_np.ndim != 2:
+        raise ValueError(f"Y_train deve ser 2D; recebido shape={y_train_np.shape}")
+    if x_val_np.ndim != 3:
+        raise ValueError(f"X_val deve ser 3D; recebido shape={x_val_np.shape}")
+    if y_val_np.ndim != 2:
+        raise ValueError(f"Y_val deve ser 2D; recebido shape={y_val_np.shape}")
 
-    if len(x_train) != len(y_train):
+    if len(x_train_np) != len(y_train_np):
         raise ValueError("X_train e Y_train devem ter o mesmo número de amostras")
-    if len(x_val) != len(y_val):
+    if len(x_val_np) != len(y_val_np):
         raise ValueError("X_val e Y_val devem ter o mesmo número de amostras")
-    if len(x_train) == 0 or len(x_val) == 0:
+    if len(x_train_np) == 0 or len(x_val_np) == 0:
         raise ValueError("Treino e validação precisam de pelo menos 1 amostra")
+
+    balance_cfg = _resolve_class_balance_cfg(
+        training_cfg,
+        fallback_threshold=float(signal_threshold),
+    )
+    long_before, short_before, neutral_before = _class_indices(
+        y_train_np,
+        target_channel=int(balance_cfg["target_channel"]),
+        threshold=float(balance_cfg["threshold"]),
+    )
+    before_stats = _class_count_stats(long_before, short_before, neutral_before)
+
+    x_train_bal = x_train_np
+    y_train_bal = y_train_np
+    sampler: WeightedRandomSampler | None = None
+    sampler_enabled = False
+    applied = False
+    status = "disabled"
+    if bool(balance_cfg["enabled"]):
+        if str(balance_cfg["method"]) == "undersample":
+            idx, applied, note = _build_undersampled_indices(
+                y_train=y_train_np,
+                target_channel=int(balance_cfg["target_channel"]),
+                threshold=float(balance_cfg["threshold"]),
+                neutral_policy=str(balance_cfg["neutral_policy"]),
+                max_neutral_ratio=float(balance_cfg["max_neutral_ratio"]),
+                seed=seed,
+            )
+            x_train_bal = x_train_np[idx]
+            y_train_bal = y_train_np[idx]
+            status = note if note else "ok"
+        else:
+            weights, applied, note = _build_weighted_sampler_weights(
+                y_train=y_train_np,
+                target_channel=int(balance_cfg["target_channel"]),
+                threshold=float(balance_cfg["threshold"]),
+                neutral_policy=str(balance_cfg["neutral_policy"]),
+                max_neutral_ratio=float(balance_cfg["max_neutral_ratio"]),
+            )
+            if applied:
+                weight_t = torch.as_tensor(weights, dtype=torch.float32)
+                sampler_generator = torch.Generator()
+                sampler_generator.manual_seed(seed)
+                sampler = WeightedRandomSampler(
+                    weight_t,
+                    num_samples=len(weight_t),
+                    replacement=True,
+                    generator=sampler_generator,
+                )
+                sampler_enabled = True
+            status = note if note else "ok"
+
+    long_after, short_after, neutral_after = _class_indices(
+        y_train_bal,
+        target_channel=int(balance_cfg["target_channel"]),
+        threshold=float(balance_cfg["threshold"]),
+    )
+    after_stats = _class_count_stats(long_after, short_after, neutral_after)
+    balance_stats: Dict[str, Any] = {
+        "enabled": bool(balance_cfg["enabled"]),
+        "applied": bool(applied),
+        "status": status,
+        "method": str(balance_cfg["method"]),
+        "target_channel": int(balance_cfg["target_channel"]),
+        "threshold": float(balance_cfg["threshold"]),
+        "neutral_policy": str(balance_cfg["neutral_policy"]),
+        "max_neutral_ratio": float(balance_cfg["max_neutral_ratio"]),
+        "sampler_enabled": bool(sampler_enabled),
+    }
+    balance_stats.update(_prefix_stats(before_stats, prefix="before"))
+    balance_stats.update(_prefix_stats(after_stats, prefix="after"))
+    if len(x_train_bal) == 0:
+        raise ValueError("class_balance removeu todas as amostras de treino; ajuste a configuração")
+
+    x_train = _to_tensor(x_train_bal, "X_train", 3)
+    y_train = _to_tensor(y_train_bal, "Y_train", 2)
+    x_val = _to_tensor(x_val_np, "X_val", 3)
+    y_val = _to_tensor(y_val_np, "Y_val", 2)
 
     if checkpoint_metric == "val_equity":
         if val_opens is None or val_closes is None:
@@ -272,7 +547,8 @@ def train_window(
     train_loader = DataLoader(
         TensorDataset(x_train, y_train),
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         drop_last=False,
     )
 
@@ -392,4 +668,5 @@ def train_window(
         num_features=num_features,
         best_epoch=best_epoch,
         checkpoint_metric=checkpoint_metric,
+        balance_stats=balance_stats,
     )
