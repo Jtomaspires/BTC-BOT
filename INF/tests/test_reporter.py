@@ -121,8 +121,13 @@ class TestReporter(unittest.TestCase):
             self.assertEqual(run_df.loc[0, "config_name"], "eth_1h_baseline")
             self.assertEqual(run_df.loc[0, "experiment_name"], "base")
             self.assertAlmostEqual(float(run_df.loc[0, "avg_return"]), 0.0, places=9)
-            self.assertIn("window_000_return", run_df.columns)
-            self.assertIn("window_001_return", run_df.columns)
+            self.assertIn("000_roi", run_df.columns)
+            self.assertIn("000_dd", run_df.columns)
+            self.assertIn("001_roi", run_df.columns)
+            self.assertIn("001_dd", run_df.columns)
+            self.assertLess(run_df.columns.get_loc("000_roi"), run_df.columns.get_loc("000_dd"))
+            self.assertLess(run_df.columns.get_loc("000_dd"), run_df.columns.get_loc("001_roi"))
+            self.assertEqual(run_df.columns[-1], "features")
             self.assertEqual(str(run_df.loc[0, "features"]), "body_over_open,volume")
 
     def test_registry_dedup_is_by_run_and_experiment(self):

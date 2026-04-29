@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Dict, Sequence, Type
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -18,8 +19,9 @@ from features import NUM_FEATURES
 class Model_1(nn.Module):
     """Conv1D — chave ``conv1d``."""
 
-    def __init__(self, num_features: int = NUM_FEATURES):
+    def __init__(self, num_features: int = NUM_FEATURES, output_dim: int | None = None):
         super().__init__()
+        out_dim = int(output_dim if output_dim is not None else num_features)
         self.conv1 = nn.Conv1d(
             in_channels=num_features,
             out_channels=32,
@@ -35,7 +37,7 @@ class Model_1(nn.Module):
             padding=1,
         )
         self.act2 = nn.GELU()
-        self.fc_out = nn.Linear(64, num_features)
+        self.fc_out = nn.Linear(64, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.permute(0, 2, 1)
@@ -52,15 +54,16 @@ class Model_1(nn.Module):
 class Model_2(nn.Module):
     """LSTM — chave ``lstm``."""
 
-    def __init__(self, num_features: int = NUM_FEATURES):
+    def __init__(self, num_features: int = NUM_FEATURES, output_dim: int | None = None):
         super().__init__()
+        out_dim = int(output_dim if output_dim is not None else num_features)
         self.lstm = nn.LSTM(
             input_size=num_features,
             hidden_size=64,
             num_layers=1,
             batch_first=True,
         )
-        self.fc_out = nn.Linear(64, num_features)
+        self.fc_out = nn.Linear(64, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.lstm(x)
@@ -72,8 +75,9 @@ class Model_2(nn.Module):
 class Model_3(nn.Module):
     """Conv1D + LSTM — chave ``hybrid``."""
 
-    def __init__(self, num_features: int = NUM_FEATURES):
+    def __init__(self, num_features: int = NUM_FEATURES, output_dim: int | None = None):
         super().__init__()
+        out_dim = int(output_dim if output_dim is not None else num_features)
         self.conv1 = nn.Conv1d(
             in_channels=num_features,
             out_channels=64,
@@ -83,7 +87,7 @@ class Model_3(nn.Module):
         )
         self.act1 = nn.GELU()
         self.lstm = nn.LSTM(64, 32, batch_first=True)
-        self.fc_out = nn.Linear(32, num_features)
+        self.fc_out = nn.Linear(32, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.permute(0, 2, 1)
@@ -103,11 +107,38 @@ ARCH_MAP: Dict[str, Type[nn.Module]] = {
 }
 
 
-def get_model(architecture: str, num_features: int = NUM_FEATURES) -> nn.Module:
+def get_model(
+    architecture: str,
+    num_features: int = NUM_FEATURES,
+    output_dim: int | None = None,
+) -> nn.Module:
     key = architecture.lower().strip()
     if key not in ARCH_MAP:
         raise ValueError(f"Arquitetura desconhecida: {architecture!r}. Usar uma de {sorted(ARCH_MAP)}.")
-    return ARCH_MAP[key](num_features=num_features)
+    return ARCH_MAP[key](num_features=num_features, output_dim=output_dim)
+
+
+def logits_to_signal(logits: np.ndarray | torch.Tensor) -> np.ndarray:
+    """
+    Converte logits de 3 classes para sinal contínuo em [-1, 1]:
+    `p_long - p_short` (classes 1 e 2).
+    """
+    if isinstance(logits, torch.Tensor):
+        x = logits.detach().to(dtype=torch.float32)
+        if x.ndim != 2 or x.shape[1] < 3:
+            raise ValueError(f"logits deve ter shape (n, >=3); recebido {tuple(x.shape)}")
+        probs = torch.softmax(x[:, :3], dim=-1)
+        signal = probs[:, 1] - probs[:, 2]
+        return signal.detach().cpu().numpy().astype(np.float64)
+
+    arr = np.asarray(logits, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 3:
+        raise ValueError(f"logits deve ser 2D com >=3 colunas; recebido {arr.shape}")
+    x = arr[:, :3]
+    x = x - np.max(x, axis=1, keepdims=True)
+    exps = np.exp(x)
+    probs = exps / np.sum(exps, axis=1, keepdims=True)
+    return (probs[:, 1] - probs[:, 2]).astype(np.float64)
 
 
 def get_action(raw_signals: Sequence[float], threshold: float) -> int:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any, Mapping, Sequence
 
 import matplotlib
@@ -144,6 +145,95 @@ def print_summary(df: pd.DataFrame) -> None:
         )
 
 
+_RUN_SUMMARY_BASE_COLUMNS = [
+    "run_id",
+    "batch_id",
+    "config_name",
+    "experiment_name",
+    "created_at",
+    "selected_split",
+    "n_windows",
+    "avg_return",
+    "avg_drawdown",
+    "avg_sharpe",
+    "pair",
+    "timeframe",
+    "data_csv_path",
+    "train_size",
+    "val_size",
+    "test_size",
+    "step_size",
+    "epochs",
+    "checkpoint_metric",
+    "architectures",
+    "grid_select_metric",
+    "signal_threshold",
+    "trailing_stop_points",
+]
+
+
+def _short_window_column(column: str) -> str:
+    old_match = re.match(r"^window_(\d+)_(return|drawdown)$", column)
+    if old_match:
+        metric = "roi" if old_match.group(2) == "return" else "dd"
+        return f"{int(old_match.group(1)):03d}_{metric}"
+
+    short_match = re.match(r"^(\d+)_(roi|dd)$", column)
+    if short_match:
+        return f"{int(short_match.group(1)):03d}_{short_match.group(2)}"
+
+    return column
+
+
+def _normalize_run_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for old_col in list(out.columns):
+        new_col = _short_window_column(str(old_col))
+        if new_col == old_col:
+            continue
+        if new_col in out.columns:
+            out[new_col] = out[new_col].combine_first(out[old_col])
+            out = out.drop(columns=[old_col])
+        else:
+            out = out.rename(columns={old_col: new_col})
+    # Safety: in case legacy columns slip through, drop them explicitly.
+    legacy_cols = [
+        c
+        for c in out.columns
+        if re.match(r"^window_\d+_(return|drawdown)$", str(c))
+    ]
+    if legacy_cols:
+        out = out.drop(columns=legacy_cols)
+    return out
+
+
+def _ordered_run_summary_columns(columns: Sequence[str]) -> list[str]:
+    existing = [str(c) for c in columns]
+    base = [c for c in _RUN_SUMMARY_BASE_COLUMNS if c in existing]
+    window_ids = sorted(
+        {
+            int(match.group(1))
+            for col in existing
+            if (match := re.match(r"^(\d+)_(roi|dd)$", col))
+        }
+    )
+    window_metrics = [
+        col
+        for window_id in window_ids
+        for col in (f"{window_id:03d}_roi", f"{window_id:03d}_dd")
+        if col in existing
+    ]
+    handled = set(base) | set(window_metrics) | {"features"}
+    # Exclude any legacy columns from ordering (should have been normalized/dropped anyway).
+    extras = [
+        c
+        for c in existing
+        if c not in handled and not re.match(r"^window_\d+_(return|drawdown)$", c)
+    ]
+    features = ["features"] if "features" in existing else []
+    return base + window_metrics + extras + features
+
+
 def build_run_summary_row(
     summary_df: pd.DataFrame,
     *,
@@ -219,7 +309,9 @@ def build_run_summary_row(
             w_id = int(row["window_id"])
             eq = float(row["final_equity"])
             w_return = (eq - position_notional) / position_notional
-            out[f"window_{w_id:03d}_return"] = w_return
+            out[f"{w_id:03d}_roi"] = w_return
+            if "max_drawdown" in rows.columns:
+                out[f"{w_id:03d}_dd"] = float(row["max_drawdown"])
 
     return out
 
@@ -277,6 +369,8 @@ def save_run_summary_row(
         batch_id=batch_id,
     )
     one_row_df = pd.DataFrame([row])
+    one_row_df = _normalize_run_summary_columns(one_row_df)
+    one_row_df = one_row_df.reindex(columns=_ordered_run_summary_columns(one_row_df.columns))
 
     run_file = Path(run_dir) / "run_summary.csv"
     run_file.parent.mkdir(parents=True, exist_ok=True)
@@ -284,11 +378,13 @@ def save_run_summary_row(
 
     registry_file = Path(output_root) / "runs_summary.csv"
     if registry_file.exists():
-        prev = pd.read_csv(registry_file)
+        prev = _normalize_run_summary_columns(pd.read_csv(registry_file))
         merged = pd.concat([prev, one_row_df], axis=0, ignore_index=True, sort=False)
         dedup_cols = [c for c in ("run_id", "experiment_name") if c in merged.columns]
         if dedup_cols:
             merged = merged.drop_duplicates(subset=dedup_cols, keep="last")
+        merged = _normalize_run_summary_columns(merged)
+        merged = merged.reindex(columns=_ordered_run_summary_columns(merged.columns))
         merged.to_csv(registry_file, index=False)
     else:
         one_row_df.to_csv(registry_file, index=False)

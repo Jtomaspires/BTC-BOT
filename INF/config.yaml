@@ -29,6 +29,13 @@ features:
     - range_over_open
     - range_over_close
     - volume
+    - ATR_14
+
+target:
+  type: triple_barrier
+  tp_pct: 0.015
+  sl_pct: 0.010
+  horizon: 8
 
 walkforward:
   train_size: 5000
@@ -45,6 +52,8 @@ training:
   learning_rate: 0.001
   seed: 0
   device: auto
+  loss: cross_entropy
+  class_balance: weighted
   checkpoint_metric: val_equity   # val_equity (CNN-aligned) | val_loss
   top_k: 3                         # apenas K melhores pesos ficam em disco
   checkpoint_min_equity: 1000.0    # só grava se val_equity > este valor
@@ -52,16 +61,10 @@ training:
     enabled: false
     patience: 10
     min_delta: 0.0
-  class_balance:
-    enabled: false
-    method: undersample      # weighted_sampler | undersample
-    target_channel: 0
-    threshold: auto               # auto => usa backtest.signal_threshold
-    neutral_policy: keep          # keep | cap_ratio | drop
-    max_neutral_ratio: 1.0        # usado quando neutral_policy = cap_ratio
 
 model:
-  architectures: [conv1d, lstm, hybrid]
+  architectures: [conv1d, lstm]
+  output_dim: 3
   warm_start_checkpoint: null
 
 backtest:

@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from models import get_model
+from models import get_model, logits_to_signal
 
 
 @dataclass(frozen=True)
@@ -40,8 +40,11 @@ class TrainResult:
     best_val_equity: float
     history: Dict[str, list[float]]
     num_features: int
+    output_dim: int
     best_epoch: int
     checkpoint_metric: str = "val_equity"
+    loss_name: str = "mse"
+    target_type: str = "next_features"
     balance_stats: Dict[str, Any] | None = None
 
     @property
@@ -62,7 +65,11 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def build_sequences(features: np.ndarray, seq_len: int) -> tuple[np.ndarray, np.ndarray]:
+def build_sequences(
+    features: np.ndarray,
+    seq_len: int,
+    labels: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     arr = np.asarray(features, dtype=np.float32)
     if arr.ndim != 2:
         raise ValueError(f"features deve ser 2D (n_rows, n_features); recebido {arr.shape}")
@@ -76,8 +83,18 @@ def build_sequences(features: np.ndarray, seq_len: int) -> tuple[np.ndarray, np.
         )
 
     x = np.stack([arr[i : i + seq_len] for i in range(n_samples)], axis=0).astype(np.float32)
-    y = arr[seq_len:].astype(np.float32)
-    return x, y
+    if labels is None:
+        y = arr[seq_len:].astype(np.float32)
+        return x, y
+
+    y_arr = np.asarray(labels).reshape(-1)
+    if y_arr.shape[0] != n_rows:
+        raise ValueError(
+            "labels deve ter o mesmo comprimento de features "
+            f"(labels={y_arr.shape[0]}, features={n_rows})"
+        )
+    y_cls = y_arr[seq_len:].astype(np.int64)
+    return x, y_cls
 
 
 def _choose_device(device_cfg: str) -> torch.device:
@@ -109,8 +126,18 @@ def _resolve_class_balance_cfg(training_cfg: Mapping[str, Any], *, fallback_thre
             "neutral_policy": "keep",
             "max_neutral_ratio": 1.0,
         }
+    if isinstance(raw, str):
+        mode = raw.strip().lower()
+        if mode in {"weighted", "weighted_sampler"}:
+            raw = {"enabled": True, "method": "weighted_sampler"}
+        elif mode in {"off", "none", "disabled"}:
+            raw = {"enabled": False}
+        else:
+            raise ValueError(
+                "training.class_balance string inválido; use weighted/weighted_sampler/off/none/disabled"
+            )
     if not isinstance(raw, Mapping):
-        raise ValueError("training.class_balance deve ser um mapeamento quando definido")
+        raise ValueError("training.class_balance deve ser string ou mapeamento quando definido")
 
     enabled = bool(raw.get("enabled", False))
     method = str(raw.get("method", "weighted_sampler")).strip().lower()
@@ -286,6 +313,25 @@ def _prefix_stats(stats: Mapping[str, Any], *, prefix: str) -> dict[str, Any]:
     return {f"{prefix}_{k}": v for k, v in stats.items()}
 
 
+def _resolve_loss_name(training_cfg: Mapping[str, Any]) -> str:
+    loss_name = str(training_cfg.get("loss", "mse")).strip().lower()
+    if loss_name not in {"mse", "cross_entropy"}:
+        raise ValueError("training.loss deve ser 'mse' ou 'cross_entropy'")
+    return loss_name
+
+
+def _cross_entropy_class_weights(y_train: np.ndarray) -> np.ndarray:
+    labels = np.asarray(y_train, dtype=np.int64).reshape(-1)
+    if labels.size == 0:
+        raise ValueError("Y_train vazio para cálculo de class weights")
+    counts = np.bincount(labels, minlength=3).astype(np.float64)
+    if np.any(counts <= 0):
+        return np.asarray([], dtype=np.float32)
+    weights = 1.0 / counts
+    weights = weights / np.sum(weights)
+    return weights.astype(np.float32)
+
+
 def compute_val_equity(
     preds_first_channel: np.ndarray,
     val_opens: np.ndarray,
@@ -428,18 +474,26 @@ def train_window(
     set_seed(seed)
     device = _choose_device(str(training_cfg.get("device", "auto")))
 
+    loss_name = _resolve_loss_name(training_cfg)
+    target_type = str(training_cfg.get("target_type", "next_features"))
     x_train_np = np.asarray(X_train, dtype=np.float32)
-    y_train_np = np.asarray(Y_train, dtype=np.float32)
     x_val_np = np.asarray(X_val, dtype=np.float32)
-    y_val_np = np.asarray(Y_val, dtype=np.float32)
+    y_train_np_raw = np.asarray(Y_train)
+    y_val_np_raw = np.asarray(Y_val)
     if x_train_np.ndim != 3:
         raise ValueError(f"X_train deve ser 3D; recebido shape={x_train_np.shape}")
-    if y_train_np.ndim != 2:
-        raise ValueError(f"Y_train deve ser 2D; recebido shape={y_train_np.shape}")
     if x_val_np.ndim != 3:
         raise ValueError(f"X_val deve ser 3D; recebido shape={x_val_np.shape}")
-    if y_val_np.ndim != 2:
-        raise ValueError(f"Y_val deve ser 2D; recebido shape={y_val_np.shape}")
+    if loss_name == "cross_entropy":
+        y_train_np = np.asarray(y_train_np_raw, dtype=np.int64).reshape(-1)
+        y_val_np = np.asarray(y_val_np_raw, dtype=np.int64).reshape(-1)
+    else:
+        y_train_np = np.asarray(y_train_np_raw, dtype=np.float32)
+        y_val_np = np.asarray(y_val_np_raw, dtype=np.float32)
+        if y_train_np.ndim != 2:
+            raise ValueError(f"Y_train deve ser 2D; recebido shape={y_train_np.shape}")
+        if y_val_np.ndim != 2:
+            raise ValueError(f"Y_val deve ser 2D; recebido shape={y_val_np.shape}")
 
     if len(x_train_np) != len(y_train_np):
         raise ValueError("X_train e Y_train devem ter o mesmo número de amostras")
@@ -448,83 +502,121 @@ def train_window(
     if len(x_train_np) == 0 or len(x_val_np) == 0:
         raise ValueError("Treino e validação precisam de pelo menos 1 amostra")
 
-    balance_cfg = _resolve_class_balance_cfg(
-        training_cfg,
-        fallback_threshold=float(signal_threshold),
-    )
-    long_before, short_before, neutral_before = _class_indices(
-        y_train_np,
-        target_channel=int(balance_cfg["target_channel"]),
-        threshold=float(balance_cfg["threshold"]),
-    )
-    before_stats = _class_count_stats(long_before, short_before, neutral_before)
-
-    x_train_bal = x_train_np
-    y_train_bal = y_train_np
     sampler: WeightedRandomSampler | None = None
     sampler_enabled = False
-    applied = False
-    status = "disabled"
-    if bool(balance_cfg["enabled"]):
-        if str(balance_cfg["method"]) == "undersample":
-            idx, applied, note = _build_undersampled_indices(
-                y_train=y_train_np,
-                target_channel=int(balance_cfg["target_channel"]),
-                threshold=float(balance_cfg["threshold"]),
-                neutral_policy=str(balance_cfg["neutral_policy"]),
-                max_neutral_ratio=float(balance_cfg["max_neutral_ratio"]),
-                seed=seed,
-            )
-            x_train_bal = x_train_np[idx]
-            y_train_bal = y_train_np[idx]
-            status = note if note else "ok"
-        else:
-            weights, applied, note = _build_weighted_sampler_weights(
-                y_train=y_train_np,
-                target_channel=int(balance_cfg["target_channel"]),
-                threshold=float(balance_cfg["threshold"]),
-                neutral_policy=str(balance_cfg["neutral_policy"]),
-                max_neutral_ratio=float(balance_cfg["max_neutral_ratio"]),
-            )
-            if applied:
-                weight_t = torch.as_tensor(weights, dtype=torch.float32)
-                sampler_generator = torch.Generator()
-                sampler_generator.manual_seed(seed)
-                sampler = WeightedRandomSampler(
-                    weight_t,
-                    num_samples=len(weight_t),
-                    replacement=True,
-                    generator=sampler_generator,
-                )
-                sampler_enabled = True
-            status = note if note else "ok"
+    class_weights_t: torch.Tensor | None = None
+    x_train_bal = x_train_np
+    balance_stats: Dict[str, Any]
+    if loss_name == "cross_entropy":
+        if np.any((y_train_np < 0) | (y_train_np > 2)) or np.any((y_val_np < 0) | (y_val_np > 2)):
+            raise ValueError("No modo cross_entropy, labels devem estar no intervalo [0, 2]")
+        class_balance_raw = training_cfg.get("class_balance")
+        weighted_enabled = str(class_balance_raw).strip().lower() in {"weighted", "true", "1"}
+        if isinstance(class_balance_raw, Mapping):
+            weighted_enabled = bool(class_balance_raw.get("enabled", False))
+        before_counts = np.bincount(y_train_np, minlength=3).astype(np.int64)
+        if weighted_enabled:
+            class_weights = _cross_entropy_class_weights(y_train_np)
+            if class_weights.size == 3:
+                class_weights_t = torch.as_tensor(class_weights, dtype=torch.float32, device=device)
+        balance_stats = {
+            "enabled": bool(weighted_enabled),
+            "applied": class_weights_t is not None,
+            "status": "ok" if class_weights_t is not None else ("class_missing" if weighted_enabled else "disabled"),
+            "method": "weighted",
+            "target_channel": 0,
+            "threshold": 0.0,
+            "neutral_policy": "keep",
+            "max_neutral_ratio": 1.0,
+            "sampler_enabled": False,
+            "before_count_total": int(np.sum(before_counts)),
+            "before_count_long": int(before_counts[1]),
+            "before_count_short": int(before_counts[2]),
+            "before_count_neutral": int(before_counts[0]),
+            "after_count_total": int(np.sum(before_counts)),
+            "after_count_long": int(before_counts[1]),
+            "after_count_short": int(before_counts[2]),
+            "after_count_neutral": int(before_counts[0]),
+        }
+    else:
+        balance_cfg = _resolve_class_balance_cfg(
+            training_cfg,
+            fallback_threshold=float(signal_threshold),
+        )
+        long_before, short_before, neutral_before = _class_indices(
+            y_train_np,
+            target_channel=int(balance_cfg["target_channel"]),
+            threshold=float(balance_cfg["threshold"]),
+        )
+        before_stats = _class_count_stats(long_before, short_before, neutral_before)
 
-    long_after, short_after, neutral_after = _class_indices(
-        y_train_bal,
-        target_channel=int(balance_cfg["target_channel"]),
-        threshold=float(balance_cfg["threshold"]),
-    )
-    after_stats = _class_count_stats(long_after, short_after, neutral_after)
-    balance_stats: Dict[str, Any] = {
-        "enabled": bool(balance_cfg["enabled"]),
-        "applied": bool(applied),
-        "status": status,
-        "method": str(balance_cfg["method"]),
-        "target_channel": int(balance_cfg["target_channel"]),
-        "threshold": float(balance_cfg["threshold"]),
-        "neutral_policy": str(balance_cfg["neutral_policy"]),
-        "max_neutral_ratio": float(balance_cfg["max_neutral_ratio"]),
-        "sampler_enabled": bool(sampler_enabled),
-    }
-    balance_stats.update(_prefix_stats(before_stats, prefix="before"))
-    balance_stats.update(_prefix_stats(after_stats, prefix="after"))
-    if len(x_train_bal) == 0:
-        raise ValueError("class_balance removeu todas as amostras de treino; ajuste a configuração")
+        y_train_bal = y_train_np
+        applied = False
+        status = "disabled"
+        if bool(balance_cfg["enabled"]):
+            if str(balance_cfg["method"]) == "undersample":
+                idx, applied, note = _build_undersampled_indices(
+                    y_train=y_train_np,
+                    target_channel=int(balance_cfg["target_channel"]),
+                    threshold=float(balance_cfg["threshold"]),
+                    neutral_policy=str(balance_cfg["neutral_policy"]),
+                    max_neutral_ratio=float(balance_cfg["max_neutral_ratio"]),
+                    seed=seed,
+                )
+                x_train_bal = x_train_np[idx]
+                y_train_bal = y_train_np[idx]
+                status = note if note else "ok"
+            else:
+                weights, applied, note = _build_weighted_sampler_weights(
+                    y_train=y_train_np,
+                    target_channel=int(balance_cfg["target_channel"]),
+                    threshold=float(balance_cfg["threshold"]),
+                    neutral_policy=str(balance_cfg["neutral_policy"]),
+                    max_neutral_ratio=float(balance_cfg["max_neutral_ratio"]),
+                )
+                if applied:
+                    weight_t = torch.as_tensor(weights, dtype=torch.float32)
+                    sampler_generator = torch.Generator()
+                    sampler_generator.manual_seed(seed)
+                    sampler = WeightedRandomSampler(
+                        weight_t,
+                        num_samples=len(weight_t),
+                        replacement=True,
+                        generator=sampler_generator,
+                    )
+                    sampler_enabled = True
+                status = note if note else "ok"
+
+        long_after, short_after, neutral_after = _class_indices(
+            y_train_bal,
+            target_channel=int(balance_cfg["target_channel"]),
+            threshold=float(balance_cfg["threshold"]),
+        )
+        after_stats = _class_count_stats(long_after, short_after, neutral_after)
+        balance_stats = {
+            "enabled": bool(balance_cfg["enabled"]),
+            "applied": bool(applied),
+            "status": status,
+            "method": str(balance_cfg["method"]),
+            "target_channel": int(balance_cfg["target_channel"]),
+            "threshold": float(balance_cfg["threshold"]),
+            "neutral_policy": str(balance_cfg["neutral_policy"]),
+            "max_neutral_ratio": float(balance_cfg["max_neutral_ratio"]),
+            "sampler_enabled": bool(sampler_enabled),
+        }
+        balance_stats.update(_prefix_stats(before_stats, prefix="before"))
+        balance_stats.update(_prefix_stats(after_stats, prefix="after"))
+        if len(x_train_bal) == 0:
+            raise ValueError("class_balance removeu todas as amostras de treino; ajuste a configuração")
 
     x_train = _to_tensor(x_train_bal, "X_train", 3)
-    y_train = _to_tensor(y_train_bal, "Y_train", 2)
     x_val = _to_tensor(x_val_np, "X_val", 3)
-    y_val = _to_tensor(y_val_np, "Y_val", 2)
+    if loss_name == "cross_entropy":
+        y_train = torch.as_tensor(y_train_np, dtype=torch.long)
+        y_val = torch.as_tensor(y_val_np, dtype=torch.long)
+    else:
+        y_train = _to_tensor(y_train_bal, "Y_train", 2)
+        y_val = _to_tensor(y_val_np, "Y_val", 2)
 
     if checkpoint_metric == "val_equity":
         if val_opens is None or val_closes is None:
@@ -539,11 +631,16 @@ def train_window(
             )
 
     num_features = int(x_train.shape[-1])
+    output_dim = int(model_cfg.get("output_dim", 3)) if loss_name == "cross_entropy" else int(num_features)
     arch = architecture or str(model_cfg.get("architecture", "conv1d"))
-    model = get_model(arch, num_features).to(device)
+    model = get_model(arch, num_features, output_dim=output_dim).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion: nn.Module = nn.MSELoss()
+    criterion: nn.Module = (
+        nn.CrossEntropyLoss(weight=class_weights_t)
+        if loss_name == "cross_entropy"
+        else nn.MSELoss()
+    )
     train_loader = DataLoader(
         TensorDataset(x_train, y_train),
         batch_size=batch_size,
@@ -592,8 +689,9 @@ def train_window(
 
         val_equity = float("nan")
         if checkpoint_metric == "val_equity":
+            val_signal = logits_to_signal(preds_val) if loss_name == "cross_entropy" else preds_val[:, 0]
             val_equity = compute_val_equity(
-                preds_val[:, 0],
+                val_signal,
                 np.asarray(val_opens, dtype=np.float64),
                 np.asarray(val_closes, dtype=np.float64),
                 position_notional=position_notional,
@@ -615,6 +713,9 @@ def train_window(
                         "val_loss": float(val_loss),
                         "architecture": arch,
                         "num_features": int(num_features),
+                        "output_dim": int(output_dim),
+                        "loss": loss_name,
+                        "target_type": target_type,
                     },
                     best_ckpt_path,
                 )
@@ -637,6 +738,9 @@ def train_window(
                         "val_loss": float(val_loss),
                         "architecture": arch,
                         "num_features": int(num_features),
+                        "output_dim": int(output_dim),
+                        "loss": loss_name,
+                        "target_type": target_type,
                     },
                     ckpt_path,
                 )
@@ -666,7 +770,10 @@ def train_window(
         best_val_equity=float(best_val_equity) if np.isfinite(best_val_equity) else float("nan"),
         history=history,
         num_features=num_features,
+        output_dim=output_dim,
         best_epoch=best_epoch,
         checkpoint_metric=checkpoint_metric,
+        loss_name=loss_name,
+        target_type=target_type,
         balance_stats=balance_stats,
     )

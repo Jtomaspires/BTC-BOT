@@ -442,6 +442,91 @@ class TestRunWalkforwardSmoke(unittest.TestCase):
             self.assertEqual(sorted(registry["experiment_name"].tolist()), ["base", "short_train"])
             self.assertTrue((td_path / "outputs" / "comparison_by_config.csv").exists())
 
+    def test_smoke_triple_barrier_cross_entropy(self):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML não instalado no ambiente de teste")
+
+        rng = np.random.default_rng(51)
+        n = 260
+        timestamps = np.arange(n, dtype=np.int64)
+        base = 100 + np.cumsum(rng.normal(0, 0.25, size=n))
+        opens = base
+        highs = base + np.abs(rng.normal(0.6, 0.15, size=n))
+        lows = base - np.abs(rng.normal(0.6, 0.15, size=n))
+        closes = base + rng.normal(0, 0.12, size=n)
+        volumes = np.abs(rng.normal(1000, 50, size=n))
+        df = pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": volumes,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            csv_path = td_path / "sample.csv"
+            df.to_csv(csv_path, index=False)
+
+            cfg = {
+                "data": {"csv_path": str(csv_path), "pair": "TEST", "timeframe": "1h"},
+                "preprocess": {"seq_len": 8},
+                "target": {"type": "triple_barrier", "tp_pct": 0.01, "sl_pct": 0.01, "horizon": 6},
+                "walkforward": {
+                    "train_size": 150,
+                    "val_size": 60,
+                    "step_size": 60,
+                    "anchor": 0,
+                    "min_train_rows": None,
+                    "test_size": None,
+                    "max_windows": 1,
+                },
+                "training": {
+                    "epochs": 2,
+                    "batch_size": 16,
+                    "learning_rate": 0.01,
+                    "seed": 0,
+                    "device": "cpu",
+                    "loss": "cross_entropy",
+                    "class_balance": "weighted",
+                    "checkpoint_metric": "val_equity",
+                    "top_k": 1,
+                    "checkpoint_min_equity": 0.0,
+                    "early_stopping": {"enabled": False, "patience": 10, "min_delta": 0.0},
+                },
+                "model": {"architecture": "conv1d", "output_dim": 3, "warm_start_checkpoint": None},
+                "backtest": {
+                    "taker_fee": 0.00055,
+                    "position_notional": 1000.0,
+                    "signal_threshold": 0.0007,
+                    "sl_points": [100.0],
+                    "tp_points": [200.0],
+                    "sl_tp_grid": None,
+                    "grid_select_metric": "sharpe",
+                },
+                "outputs": {"output_dir": str(td_path / "outputs")},
+            }
+
+            import yaml
+
+            cfg_path = td_path / "config.yaml"
+            with cfg_path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=False)
+
+            summary_df, run_dir = RW.run_walkforward(cfg_path)
+            self.assertFalse(summary_df.empty)
+            self.assertIn("bal_method_conv1d", summary_df.columns)
+            self.assertEqual(str(summary_df["bal_method_conv1d"].iloc[0]), "weighted")
+            ckpt_dir = run_dir / "window_000" / "checkpoints" / "conv1d"
+            pt_files = sorted(ckpt_dir.glob("*.pt"))
+            self.assertGreaterEqual(len(pt_files), 1)
+            self.assertLessEqual(len(pt_files), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

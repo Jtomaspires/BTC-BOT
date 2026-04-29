@@ -43,6 +43,13 @@ class TestModelForward(unittest.TestCase):
         with self.assertRaises(ValueError):
             M.get_model("transformer", num_features=self.nf)
 
+    def test_output_dim_override(self):
+        m = M.get_model("conv1d", num_features=self.nf, output_dim=3)
+        m.eval()
+        with torch.no_grad():
+            y = m(self.x)
+        self.assertEqual(y.shape, (self.batch, 3))
+
 
 class TestGetAction(unittest.TestCase):
     def test_threshold(self):
@@ -52,6 +59,23 @@ class TestGetAction(unittest.TestCase):
 
     def test_empty(self):
         self.assertEqual(M.get_action([], 0.5), 0)
+
+
+class TestLogitsToSignal(unittest.TestCase):
+    def test_logits_to_signal_shape_and_range(self):
+        logits = torch.tensor(
+            [
+                [0.0, 2.0, 0.0],
+                [0.0, 0.0, 2.0],
+                [0.0, 1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        s = M.logits_to_signal(logits)
+        self.assertEqual(s.shape, (3,))
+        self.assertGreater(s[0], 0.0)
+        self.assertLess(s[1], 0.0)
+        self.assertAlmostEqual(float(s[2]), 0.0, places=6)
 
 
 if __name__ == "__main__":

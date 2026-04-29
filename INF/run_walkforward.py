@@ -18,8 +18,9 @@ import torch
 from backtest_engine import BacktestResult, run_backtest_grid, run_single_backtest
 from data_loader import default_project_root, iter_walkforward_windows, load_ohlcv
 from features import build_features, resolve_feature_list
+from labels import build_triple_barrier_labels
 from metrics import max_drawdown_info, select_best_grid_params, sharpe_ratio, summarize_window
-from models import get_model
+from models import get_action, get_model, logits_to_signal
 from reporter import (
     plot_equity_curve,
     plot_equity_with_buyhold,
@@ -139,6 +140,79 @@ def _grid_results_from_cfg(
     )
 
 
+def _save_signals_csv(
+    *,
+    out_path: Path,
+    df_slice: pd.DataFrame,
+    seq_len: int,
+    raw_signal_per_bar: np.ndarray,
+    signal_threshold: float,
+    eval_split: str,
+    aligned_mask: np.ndarray | None = None,
+) -> Path:
+    """
+    Persiste sinais por barra para análise rápida (dashboard) sem recarregar modelo.
+
+    Convenção igual ao backtest:
+    - `raw_signal_per_bar` tem comprimento `n = len(opens) - 1`
+    - OHLCV é alinhado com `df_slice[col][seq_len:]` e truncado para `n` barras
+      (a última barra do OHLC não tem `signal` associado).
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(df_slice) <= seq_len + 1:
+        raise ValueError("df_slice demasiado pequeno para seq_len + 1 barras")
+
+    opens = df_slice["open"].to_numpy(dtype=np.float64)[seq_len:]
+    highs = df_slice["high"].to_numpy(dtype=np.float64)[seq_len:]
+    lows = df_slice["low"].to_numpy(dtype=np.float64)[seq_len:]
+    closes = df_slice["close"].to_numpy(dtype=np.float64)[seq_len:]
+    volumes = df_slice["volume"].to_numpy(dtype=np.float64)[seq_len:]
+    if aligned_mask is not None:
+        mask = np.asarray(aligned_mask, dtype=bool).reshape(-1)
+        if mask.shape[0] != opens.shape[0]:
+            raise ValueError(
+                f"aligned_mask length {mask.shape[0]} != aligned OHLC length {opens.shape[0]}"
+            )
+        opens = opens[mask]
+        highs = highs[mask]
+        lows = lows[mask]
+        closes = closes[mask]
+        volumes = volumes[mask]
+
+    n = len(opens) - 1
+    sig = np.asarray(raw_signal_per_bar, dtype=np.float64).reshape(-1)[:n]
+    if len(sig) != n:
+        raise ValueError(f"raw_signal_per_bar length {len(sig)} != n {n}")
+
+    ts = None
+    if "timestamp" in df_slice.columns:
+        ts_full = df_slice["timestamp"].to_numpy()[seq_len:]
+        if aligned_mask is not None:
+            ts_full = ts_full[np.asarray(aligned_mask, dtype=bool).reshape(-1)]
+        ts = ts_full[:n]
+    else:
+        ts = np.arange(n, dtype=np.int64)
+
+    desired = np.asarray([get_action([float(x)], threshold=float(signal_threshold)) for x in sig], dtype=np.int64)
+
+    out_df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "eval_split": str(eval_split),
+            "signal": sig,
+            "desired": desired,
+            "open": opens[:n],
+            "high": highs[:n],
+            "low": lows[:n],
+            "close": closes[:n],
+            "volume": volumes[:n],
+        }
+    )
+    out_df.to_csv(out_path, index=False)
+    return out_path
+
+
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(dict(base))
     for key, val in override.items():
@@ -210,6 +284,26 @@ def _resolve_training_cfg(training_cfg: Mapping[str, Any], backtest_cfg: Mapping
             cb["threshold"] = float(backtest_cfg.get("signal_threshold", 0.0))
         resolved["class_balance"] = cb
     return resolved
+
+
+def _resolve_target_cfg(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    raw = cfg.get("target")
+    if raw is None:
+        return {"type": "next_features"}
+    if not isinstance(raw, Mapping):
+        raise ValueError("target deve ser um mapeamento")
+    target_type = str(raw.get("type", "next_features")).strip().lower()
+    if target_type == "next_features":
+        return {"type": "next_features"}
+    if target_type != "triple_barrier":
+        raise ValueError("target.type deve ser 'next_features' ou 'triple_barrier'")
+
+    tp_pct = float(raw.get("tp_pct", 0.0))
+    sl_pct = float(raw.get("sl_pct", 0.0))
+    horizon = int(raw.get("horizon", 0))
+    if tp_pct <= 0 or sl_pct <= 0 or horizon <= 0:
+        raise ValueError("target triple_barrier requer tp_pct>0, sl_pct>0 e horizon>0")
+    return {"type": "triple_barrier", "tp_pct": tp_pct, "sl_pct": sl_pct, "horizon": horizon}
 
 
 def _attach_balance_columns(
@@ -302,11 +396,14 @@ def _run_single_experiment(
     train_cfg = _resolve_training_cfg(cfg["training"], cfg["backtest"])
     model_cfg = cfg["model"]
     backtest_cfg = cfg["backtest"]
+    target_cfg = _resolve_target_cfg(cfg)
     features_used = _resolve_feature_list_from_cfg(cfg)
+    train_cfg["target_type"] = str(target_cfg.get("type", "next_features"))
 
     resolved_cfg = copy.deepcopy(dict(cfg))
     resolved_cfg["training"] = copy.deepcopy(dict(train_cfg))
     resolved_cfg["features"] = {"list": list(features_used)}
+    resolved_cfg["target"] = copy.deepcopy(dict(target_cfg))
     _save_yaml(run_dir / "config.resolved.yaml", resolved_cfg)
 
     seq_len = int(preprocess_cfg["seq_len"])
@@ -388,14 +485,51 @@ def _run_single_experiment(
                 selected_features=features_used,
             )
 
-        x_train, y_train = build_sequences(train_features, seq_len=seq_len)
-        x_val, y_val = build_sequences(val_features, seq_len=seq_len)
+        if str(target_cfg["type"]) == "triple_barrier":
+            train_labels = build_triple_barrier_labels(
+                train_df["close"].to_numpy(dtype=np.float64),
+                train_df["high"].to_numpy(dtype=np.float64),
+                train_df["low"].to_numpy(dtype=np.float64),
+                tp_pct=float(target_cfg["tp_pct"]),
+                sl_pct=float(target_cfg["sl_pct"]),
+                horizon=int(target_cfg["horizon"]),
+            )
+            val_labels = build_triple_barrier_labels(
+                val_df["close"].to_numpy(dtype=np.float64),
+                val_df["high"].to_numpy(dtype=np.float64),
+                val_df["low"].to_numpy(dtype=np.float64),
+                tp_pct=float(target_cfg["tp_pct"]),
+                sl_pct=float(target_cfg["sl_pct"]),
+                horizon=int(target_cfg["horizon"]),
+            )
+            x_train, y_train = build_sequences(train_features, seq_len=seq_len, labels=train_labels)
+            x_val_raw, y_val_raw = build_sequences(val_features, seq_len=seq_len, labels=val_labels)
+            valid_train = y_train >= 0
+            valid_val = y_val_raw >= 0
+            x_train = x_train[valid_train]
+            y_train = y_train[valid_train]
+            x_val = x_val_raw[valid_val]
+            y_val = y_val_raw[valid_val]
+            if len(x_train) == 0 or len(x_val) == 0:
+                raise ValueError(
+                    f"Sem amostras válidas após filtro triple_barrier na janela {w.window_id}. "
+                    "Ajuste horizon/train_size/val_size."
+                )
+        else:
+            x_train, y_train = build_sequences(train_features, seq_len=seq_len)
+            x_val, y_val = build_sequences(val_features, seq_len=seq_len)
+
         x_test = None
         if has_test and test_features is not None:
             x_test, _ = build_sequences(test_features, seq_len=seq_len)
-
-        val_opens_aligned = val_df["open"].to_numpy(dtype=np.float64)[seq_len:]
-        val_closes_aligned = val_df["close"].to_numpy(dtype=np.float64)[seq_len:]
+        val_opens_full = val_df["open"].to_numpy(dtype=np.float64)[seq_len:]
+        val_closes_full = val_df["close"].to_numpy(dtype=np.float64)[seq_len:]
+        if str(target_cfg["type"]) == "triple_barrier":
+            val_opens_aligned = val_opens_full[valid_val]
+            val_closes_aligned = val_closes_full[valid_val]
+        else:
+            val_opens_aligned = val_opens_full
+            val_closes_aligned = val_closes_full
 
         device = _device_for_inference(str(train_cfg.get("device", "auto")))
         x_val_t = torch.from_numpy(x_val.astype(np.float32)).to(device)
@@ -428,7 +562,11 @@ def _run_single_experiment(
             checkpoints_by_arch[arch] = len(train_result.best_checkpoint_paths)
             balance_stats_by_arch[arch] = dict(train_result.balance_stats or {})
             for ckpt_path in train_result.best_checkpoint_paths:
-                model = get_model(arch, num_features=train_result.num_features).to(device)
+                model = get_model(
+                    arch,
+                    num_features=train_result.num_features,
+                    output_dim=train_result.output_dim,
+                ).to(device)
                 try:
                     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
                 except TypeError:
@@ -437,12 +575,18 @@ def _run_single_experiment(
                 model.eval()
                 with torch.no_grad():
                     preds_val = model(x_val_t).cpu().numpy()
-                # Paridade com CNN `ensemble_raw_signals`: usa primeiro canal (feature 1).
-                raw_signal_val_per_ckpt.append(preds_val[:, 0].astype(np.float64))
+                if str(target_cfg["type"]) == "triple_barrier":
+                    raw_signal_val_per_ckpt.append(logits_to_signal(preds_val))
+                else:
+                    # Paridade com CNN `ensemble_raw_signals`: usa primeiro canal (feature 1).
+                    raw_signal_val_per_ckpt.append(preds_val[:, 0].astype(np.float64))
                 if x_test_t is not None:
                     with torch.no_grad():
                         preds_test = model(x_test_t).cpu().numpy()
-                    raw_signal_test_per_ckpt.append(preds_test[:, 0].astype(np.float64))
+                    if str(target_cfg["type"]) == "triple_barrier":
+                        raw_signal_test_per_ckpt.append(logits_to_signal(preds_test))
+                    else:
+                        raw_signal_test_per_ckpt.append(preds_test[:, 0].astype(np.float64))
                 del model
 
         if not raw_signal_val_per_ckpt:
@@ -459,6 +603,11 @@ def _run_single_experiment(
         high_val = val_df["high"].to_numpy(dtype=np.float64)[seq_len:]
         low_val = val_df["low"].to_numpy(dtype=np.float64)[seq_len:]
         close_val = val_df["close"].to_numpy(dtype=np.float64)[seq_len:]
+        if str(target_cfg["type"]) == "triple_barrier":
+            open_val = open_val[valid_val]
+            high_val = high_val[valid_val]
+            low_val = low_val[valid_val]
+            close_val = close_val[valid_val]
         raw_signal_val = raw_signal_val[: len(open_val) - 1]
         if len(raw_signal_val) != (len(open_val) - 1):
             raise RuntimeError(
@@ -555,6 +704,39 @@ def _run_single_experiment(
         win_df = pd.concat(per_split_metrics, axis=0, ignore_index=True, sort=False)
 
         win_dir = run_dir / f"window_{w.window_id:03d}"
+        # Persist signals for fast dashboard SL/TP grids (prefer test when available).
+        # We always write signals_val.csv; when test exists we also write signals_test.csv and
+        # set signals.csv to the test split; otherwise signals.csv points to val split.
+        _save_signals_csv(
+            out_path=win_dir / "signals_val.csv",
+            df_slice=val_df,
+            seq_len=seq_len,
+            raw_signal_per_bar=raw_signal_val,
+            signal_threshold=float(backtest_cfg["signal_threshold"]),
+            eval_split="val",
+            aligned_mask=(valid_val if str(target_cfg["type"]) == "triple_barrier" else None),
+        )
+        primary_src = win_dir / "signals_val.csv"
+        if has_test and test_df is not None:
+            _save_signals_csv(
+                out_path=win_dir / "signals_test.csv",
+                df_slice=test_df,
+                seq_len=seq_len,
+                raw_signal_per_bar=raw_signal_test,
+                signal_threshold=float(backtest_cfg["signal_threshold"]),
+                eval_split="test",
+            )
+            primary_src = win_dir / "signals_test.csv"
+        # Copy (not symlink) to a stable name `signals.csv`.
+        try:
+            import shutil
+
+            shutil.copyfile(primary_src, win_dir / "signals.csv")
+        except OSError:
+            # fallback: write again under signals.csv
+            src_df = pd.read_csv(primary_src)
+            src_df.to_csv(win_dir / "signals.csv", index=False)
+
         save_metrics_csv(win_df, win_dir / "metrics.csv")
         best_equity = best_result_for_plot.equities
         dd_info = max_drawdown_info(best_equity)

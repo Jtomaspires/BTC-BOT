@@ -44,6 +44,15 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(y.shape, (6, 6))
         self.assertTrue(np.allclose(y[0], fts[4]))
 
+    def test_build_sequences_with_labels(self):
+        fts = np.arange(60, dtype=np.float32).reshape(10, 6)
+        labels = np.asarray([0, 1, 2, 0, 1, 2, 0, 1, -1, -1], dtype=np.int64)
+        x, y = TR.build_sequences(fts, seq_len=4, labels=labels)
+        self.assertEqual(x.shape, (6, 4, 6))
+        self.assertEqual(y.shape, (6,))
+        self.assertEqual(y.dtype, np.int64)
+        self.assertEqual(int(y[0]), 1)
+
     def test_undersample_balances_directional_classes_deterministic(self):
         y = np.zeros((18, 2), dtype=np.float32)
         y[:10, 0] = 0.2
@@ -215,6 +224,52 @@ class TestTrainer(unittest.TestCase):
                     out_dir=Path(td),
                     window_id=0,
                 )
+
+    def test_cross_entropy_training_supports_weighted_balance(self):
+        rng = np.random.default_rng(5)
+        n_feat = 8
+        seq_len = 6
+        x_train = rng.normal(size=(120, seq_len, n_feat)).astype(np.float32)
+        y_train = np.asarray([0] * 70 + [1] * 30 + [2] * 20, dtype=np.int64)
+        x_val = rng.normal(size=(60, seq_len, n_feat)).astype(np.float32)
+        y_val = np.asarray([0] * 30 + [1] * 15 + [2] * 15, dtype=np.int64)
+        val_opens = np.linspace(100.0, 110.0, len(x_val), dtype=np.float64)
+        val_closes = val_opens + 0.3
+
+        training_cfg = {
+            "epochs": 2,
+            "batch_size": 16,
+            "learning_rate": 0.005,
+            "seed": 42,
+            "device": "cpu",
+            "loss": "cross_entropy",
+            "class_balance": "weighted",
+            "checkpoint_metric": "val_equity",
+            "top_k": 1,
+            "checkpoint_min_equity": 0.0,
+            "early_stopping": {"enabled": False, "patience": 10, "min_delta": 0.0},
+            "target_type": "triple_barrier",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            result = TR.train_window(
+                training_cfg=training_cfg,
+                model_cfg={"architecture": "conv1d", "output_dim": 3},
+                architecture="conv1d",
+                X_train=x_train,
+                Y_train=y_train,
+                X_val=x_val,
+                Y_val=y_val,
+                out_dir=Path(td),
+                window_id=0,
+                val_opens=val_opens,
+                val_closes=val_closes,
+                position_notional=1000.0,
+                signal_threshold=0.05,
+            )
+            self.assertEqual(result.loss_name, "cross_entropy")
+            self.assertEqual(result.output_dim, 3)
+            self.assertEqual(result.target_type, "triple_barrier")
+            self.assertTrue(result.best_checkpoint_paths)
 
 
 if __name__ == "__main__":
