@@ -29,11 +29,9 @@ st.markdown(
 Use as páginas no menu do Streamlit (sidebar) para navegar:
 
 - Overview (experiments)
-- Window analysis (forensics)
-- SL/TP heatmap (signals.csv)
-- Correlations
-- Timeline
-- Compare
+- Threshold Analyzer, ATR Dynamic Explorer, Settings Comparator
+- ATR robustness
+- Window replay
 """
 )
 

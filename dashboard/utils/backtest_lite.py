@@ -9,12 +9,13 @@ assert _spec is not None and _spec.loader is not None
 _spec.loader.exec_module(importlib.util.module_from_spec(_spec))
 
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Iterable, Literal, Optional
 
 import numpy as np
 import pandas as pd
 
-from INF.backtest_engine import run_backtest_grid
+from dashboard.utils.trades import replay_signals_full
+
 from INF.metrics import max_drawdown_info, sharpe_ratio
 
 
@@ -46,51 +47,6 @@ def _neighbor_mean(mat: np.ndarray) -> np.ndarray:
     return out
 
 
-def _align_ohlc_for_engine(
-    signals_df: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Alinhamento bit-exato com ``INF/run_walkforward`` (test e val).
-
-    Convenção do ``run_walkforward._save_signals_csv``:
-    - Salva ``n`` linhas OHLC e ``n`` sinais (1 linha por sinal).
-    - Os ``n`` opens do CSV == ``opens[0..n-1]`` que o engine **realmente usa** no loop.
-
-    Convenção do ``run_single_backtest`` (engine):
-    - Exige ``len(opens) == len(signal) + 1``, mas só lê ``opens[0..n-1]``.
-    - A última barra ``opens[n]`` é apenas para a invariante de tamanho — nunca acessada
-      no loop nem no fecho final (que usa ``c[n-1]``).
-
-    Logo, basta **apender** uma barra fantasma (duplicar a última do CSV); o resultado
-    do backtest é numericamente idêntico ao INF.
-    """
-    raw = signals_df["signal"].to_numpy(dtype=np.float64)
-    o0 = signals_df["open"].to_numpy(dtype=np.float64)
-    h0 = signals_df["high"].to_numpy(dtype=np.float64)
-    l0 = signals_df["low"].to_numpy(dtype=np.float64)
-    c0 = signals_df["close"].to_numpy(dtype=np.float64)
-
-    if raw.shape[0] == 0:
-        raise ValueError("signals_df is empty")
-    if not (o0.shape[0] == h0.shape[0] == l0.shape[0] == c0.shape[0]):
-        raise ValueError("OHLC columns must all have the same length in signals_df")
-
-    if o0.shape[0] == raw.shape[0] + 1:
-        return raw, o0, h0, l0, c0
-
-    if o0.shape[0] != raw.shape[0]:
-        raise ValueError(
-            f"Inconsistent signal vs OHLC row counts: signal={raw.shape[0]}, OHLC={o0.shape[0]} "
-            "(expected equal rows, or OHLC = signal + 1 if already aligned)."
-        )
-
-    o = np.concatenate([o0, [o0[-1]]])
-    h = np.concatenate([h0, [h0[-1]]])
-    l = np.concatenate([l0, [l0[-1]]])
-    c = np.concatenate([c0, [c0[-1]]])
-    return raw, o, h, l, c
-
-
 def run_grid(
     *,
     signals_df: pd.DataFrame,
@@ -108,7 +64,7 @@ def run_grid(
 
     Resultado **bit-exato** com ``INF/run_walkforward`` quando ``signal_threshold``,
     ``taker_fee``, ``position_notional`` e ``trailing_stop_points`` são iguais aos do
-    config — ver ``_align_ohlc_for_engine`` para o porquê.
+    config — ver ``dashboard.utils.ohlc_align.align_ohlc_for_engine`` para o porquê.
 
     Returns a dict keyed by (sl, tp, threshold, trailing_stop).
     Robustness é a média da vizinhança 8 da equity por (threshold, trailing_stop).
@@ -120,8 +76,6 @@ def run_grid(
     if missing:
         raise ValueError(f"signals_df missing columns: {sorted(missing)}")
 
-    raw, o, h, l, c = _align_ohlc_for_engine(signals_df)
-
     sls = [float(x) for x in sl_values]
     tps = [float(x) for x in tp_values]
     thrs = [float(x) for x in threshold_values]
@@ -131,30 +85,25 @@ def run_grid(
 
     for thr in thrs:
         for trail in trails:
-            grid = run_backtest_grid(
-                raw,
-                o,
-                h,
-                l,
-                c,
-                sl_points=sls,
-                tp_points=tps,
-                trailing_stop_points=[trail],
-                taker_fee=float(taker_fee),
-                position_notional=float(position_notional),
-                signal_threshold=float(thr),
-            )
-            # Build equity matrix for robustness scoring.
             equity_mat = np.full((len(sls), len(tps)), np.nan, dtype=np.float64)
             cell_tmp: dict[tuple[float, float], tuple[float, float, float]] = {}
-            for (sl, tp, _trail), res in grid.items():
-                eq_final = float(res.equities[-1]) if len(res.equities) else float(position_notional)
-                sh = float(sharpe_ratio(res.equities, periods_per_year=periods_per_year))
-                dd = float(max_drawdown_info(res.equities).get("max_drawdown", 0.0))
-                cell_tmp[(float(sl), float(tp))] = (eq_final, sh, dd)
-                i = sls.index(float(sl))
-                j = tps.index(float(tp))
-                equity_mat[i, j] = eq_final
+            for i, sl in enumerate(sls):
+                for j, tp in enumerate(tps):
+                    rep = replay_signals_full(
+                        signals_df,
+                        sl_points=float(sl),
+                        tp_points=float(tp),
+                        signal_threshold=float(thr),
+                        trailing_stop_points=float(trail),
+                        taker_fee=float(taker_fee),
+                        position_notional=float(position_notional),
+                    )
+                    res_eq = rep.equities
+                    eq_final = float(res_eq[-1]) if len(res_eq) else float(position_notional)
+                    sh = float(sharpe_ratio(res_eq, periods_per_year=periods_per_year))
+                    dd = float(max_drawdown_info(res_eq).get("max_drawdown", 0.0))
+                    cell_tmp[(float(sl), float(tp))] = (eq_final, sh, dd)
+                    equity_mat[i, j] = eq_final
 
             robust = _neighbor_mean(equity_mat)
             for i, sl in enumerate(sls):
@@ -169,3 +118,57 @@ def run_grid(
 
     return out
 
+
+GridMetric = Literal["sharpe", "equity", "robustness"]
+
+
+def _metric_scalar(m: CellMetrics, metric: str) -> float:
+    key = str(metric).strip().lower()
+    if key == "sharpe":
+        return float(m.sharpe)
+    if key in {"equity", "final_equity"}:
+        return float(m.equity)
+    if key in {"robustness", "robust"}:
+        return float(m.robustness)
+    raise ValueError(
+        f"metric inválido: {metric!r}. Use 'sharpe', 'equity' ou 'robustness'."
+    )
+
+
+def find_best_cell(
+    out: dict[tuple[float, float, float, float], CellMetrics],
+    metric: GridMetric | str = "sharpe",
+) -> tuple[tuple[float, float, float, float], CellMetrics, float]:
+    """
+    Melhor célula do grid completo (SL, TP, threshold, trailing).
+
+    Desempate determinístico: maior score; em empate aproximado (``rtol=1e-9``),
+    escolhe a chave lexicográfica maior ``(sl, tp, thr, trail)``.
+    """
+    if not out:
+        raise ValueError("grid vazio")
+
+    best_key: tuple[float, float, float, float] | None = None
+    best_m: CellMetrics | None = None
+    best_score: float | None = None
+
+    for key, m in out.items():
+        score = _metric_scalar(m, metric)
+        if not np.isfinite(score):
+            continue
+        sl, tp, thr, trail = (float(key[0]), float(key[1]), float(key[2]), float(key[3]))
+        tup_key = (sl, tp, thr, trail)
+
+        if best_score is None:
+            best_key, best_m, best_score = tup_key, m, score
+            continue
+
+        assert best_key is not None
+        if score > best_score or (
+            np.isclose(score, best_score, rtol=1e-9, atol=0.0) and tup_key > best_key
+        ):
+            best_key, best_m, best_score = tup_key, m, score
+
+    if best_key is None or best_m is None or best_score is None:
+        raise ValueError("Nenhuma célula com métrica finita no grid.")
+    return best_key, best_m, float(best_score)

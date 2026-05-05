@@ -47,8 +47,10 @@ SUPPORTED = {
     "RSI_14",
     "RSI_21",
     "ATR_14",
+    "ATR_200",
     "MACD_12_26_9",
     "MACDh_12_26_9",
+    "MACD_hist",
     "Vol20",
     "Vol50",
     "dist_ma20",
@@ -70,6 +72,8 @@ def compute_indicators(df: pd.DataFrame, indicators: list[str]) -> pd.DataFrame:
             out[ind] = rsi(close, 21)
         elif ind == "ATR_14":
             out[ind] = atr(out, 14)
+        elif ind == "ATR_200":
+            out[ind] = atr(out, 200)
         elif ind == "MACD_12_26_9":
             macd_line, signal_line, _hist = macd(close, 12, 26, 9)
             out["MACD_12_26_9"] = macd_line
@@ -79,6 +83,11 @@ def compute_indicators(df: pd.DataFrame, indicators: list[str]) -> pd.DataFrame:
             out["MACD_12_26_9"] = macd_line
             out["MACDs_12_26_9"] = signal_line
             out["MACDh_12_26_9"] = hist
+        elif ind == "MACD_hist":
+            macd_line, signal_line, hist = macd(close, 12, 26, 9)
+            out["MACD_12_26_9"] = macd_line
+            out["MACDs_12_26_9"] = signal_line
+            out["MACD_hist"] = hist
         elif ind == "Vol20":
             out[ind] = out["volume"].astype(float).rolling(20, min_periods=20).mean()
         elif ind == "Vol50":

@@ -1,0 +1,87 @@
+config_name: eth_1h_train_sizes_thr007_v4
+
+data:
+  csv_path: CNN\data\raw\ETHUSDT-1h-data.csv
+  pair: ETHUSDT
+  timeframe: 1h
+  recent_rows: 17980
+
+preprocess:
+  seq_len: 48
+
+features:
+  list:
+    - body_over_open
+    - high_minus_open_over_open
+    - high_minus_close_over_close
+    - low_minus_open_over_open
+    - low_minus_close_over_close
+    - range_over_open
+    - range_over_close
+    - volume
+    - ATR_14
+
+walkforward:
+  train_size: 5000 # overridden per experiment
+  val_size: 700
+  step_size: 700
+  max_windows: null
+  anchor: 0
+  min_train_rows: null
+  test_size: 700
+
+training:
+  epochs: 200
+  batch_size: 64
+  learning_rate: 0.001
+  seed: 0
+  device: auto
+  checkpoint_metric: val_equity
+  top_k: 3
+  checkpoint_min_equity: 1000.0
+  early_stopping:
+    enabled: false
+    patience: 10
+    min_delta: 0.0
+  class_balance:
+    enabled: true
+    method: weighted_sampler
+    target_channel: 0
+    threshold: auto
+    neutral_policy: keep
+    max_neutral_ratio: 1.0
+
+model:
+  architectures:
+    - conv1d
+    - lstm
+    - hybrid
+  warm_start_checkpoint: null
+
+backtest:
+  taker_fee: 0.00055
+  position_notional: 1000.0
+  signal_threshold: 0.007
+  sl_points: [4]
+  tp_points: [75]
+  trailing_stop_points: [10]
+  sl_tp_grid: null
+  grid_select_metric: final_equity
+
+outputs:
+  output_dir: INF/outputs
+
+experiments:
+  - name: train_5000
+    walkforward:
+      train_size: 5000
+  - name: train_7500
+    walkforward:
+      train_size: 7500
+  - name: train_10000
+    walkforward:
+      train_size: 10000
+  - name: train_15000
+    walkforward:
+      train_size: 15000
+
